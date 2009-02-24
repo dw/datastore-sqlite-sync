@@ -15,8 +15,8 @@ Maintains an SQLite database constructs like so:
         value:                  Value of property.
 
     View <ModelClassName>: ModelClassName
-        Combined 'tabular' representation of model instances, containing a row
-        for every instance and a column for every property.
+        Combined 'tabular' representation of model instances, containing a
+        row for every instance and a column for every property.
 
         __id:           model_class_name.id
         property_name:  model_class_name_property_name.value
@@ -109,6 +109,72 @@ def init_sdk_env(app_name, email, password, remote_path='/remote_api'):
 # Program implementation.
 #
 
+def translate_type(typ):
+    '''
+    Given a Python type, or one of the extended AppEngine type classes,
+    return a string describing what SQL data type Datastore properties of
+    this type should be mapped to.
+
+    The type parameter comes from the Property class's data_type class
+    variable.
+
+    Returns a tuple whose first item is a string with the SQL data type, and
+    second item is a function that when called on a value of this type,
+    returns a value suitable for INSERTing with DBAPI.
+
+    @param[in]  typ         One of appengine.ext.db._ALLOWED_PROPERTY_TYPES.
+    @returns                ("SQL TYPE", translator function)
+    @raises     TypeError   Type cannot be translated to SQL.
+    '''
+
+    for sql_type, rules in translate_type.map:
+        for klass, translator in rules:
+            if issubclass(typ, klass):
+                return sql_type, translator
+
+    raise TypeError('don\'t know how to translate type %r to SQL.' % (typ,))
+
+
+def build_translate_type_map():
+    '''
+    Build the mappings of Datastore types to SQL types and translator
+    functions. This is done inside a function because the AppEngine SDK is not
+    statically imported.
+    '''
+
+    # ( 'DestSqlType' -> ( (issubclass, translator), ), )
+    # When modifying, be very aware of inheritance hierarchy and effects it
+    # has on the order of below.
+    translate_type.map = (
+        ( 'TEXT', (
+            ( datastore_types.Key, lambda v: str(v) ),
+            # Map 8 bit data using a codepage that defines every value.
+            ( datastore_types.ByteString, lambda v: v.decode('iso8859-1') ),
+            ( datastore_types.IM, lambda v: unicode(v) ),
+            ( users.User, lambda v: v.email() ),
+            ( datastore_types.GeoPt, lambda v: '%s:%s' % (v.lat, v.lon) ),
+            ( str, lambda v: v.decode('iso8859-1') ),
+            ( unicode, lambda v: v ),
+            ( basestring, lambda v: unicode(v) ),
+        ), ),
+        ( 'DATETIME', (
+            ( datetime, lambda v: v.strftime('%Y-%m-%d %H:%M:%S') ),
+            # TODO(dmw): what to do with these?
+            ( time,     lambda v: v.strftime('01-01-1970 %H:%M:%S') ),
+            ( date,     lambda v: v.strftime('%Y-%m-%d %H:%M:%S') ),
+        ), ),
+        ( 'INTEGER', (
+            # int catches bool too.
+            ( int, lambda v: long(v) ),
+            # catching Rating too.
+            ( long, lambda v: long(v) ),
+        ), ),
+        ( 'REAL', (
+            ( float, lambda v: v ),
+        ), ),
+    )
+
+
 def get_models(lib_paths, module_names):
     '''
     Load a set of Python modules and search them for subclasses of
@@ -175,81 +241,48 @@ def translate_name(class_name, prop_name=None):
     return output.getvalue()
 
 
-def translate_type(typ):
+def get_model_map(models):
     '''
-    Given a Python type, or one of the extended AppEngine type classes, return
-    a string describing what SQL data type Datastore properties of this type
-    should be mapped to.
+    Return a mapping of the given models to dictionaries containing tuples of
+    information mapping their properties to SQL.
 
-    The type parameter comes from the Property class's data_type class
-    variable.
-
-    Returns a tuple whose first item is a string with the SQL data type, and
-    second item is a function that when called on a value of this type,
-    returns a value suitable for INSERTing with DBAPI.
-
-    @param[in]  typ         One of appengine.ext.db._ALLOWED_PROPERTY_TYPES.
-    @returns                ("SQL TYPE", translator function)
-    @raises     TypeError   Type cannot be translated to SQL.
+    @param[in]  models      Sequence of Model subclasses.
+    @returns                Complex structure. See code.
     '''
 
-    for sql_type, rules in translate_type.map:
-        for klass, translator in rules:
-            if issubclass(typ, klass):
-                return sql_type, translator
+    map = {}
+    for klass in models:
+        table_name = translate_name(klass.__name__)
+        props = {}
 
-    raise TypeError('don\'t know how to translate type %r to SQL.' % (typ,))
+        for prop_name, prop in klass.properties().iteritems():
+            prop_table_name = translate_name(table_name, prop_name)
+            # TODO(dmw): seems like a bug in the SDK. data_type should be
+            # Key, not Model.
+            if isinstance(prop, db.ReferenceProperty):
+                typ = db.Key
+            else:
+                typ = prop.data_type
 
+            try:
+                sql_type, translator = translate_type(typ)
+            except TypeError, e:
+                logging.error('%s.%s: %s', klass.__name__, prop_name, e)
+                raise
 
-def build_translate_type_map():
-    '''
-    Build the mappings of Datastore types to SQL types and translator
-    functions. This is done inside a function because the AppEngine SDK is not
-    statically imported.
-    '''
+            props[prop_name] = prop, prop_table_name, sql_type, translator
 
-    global translate_type
-
-    # ( 'DestSqlType' -> ( ( issubclass, translator ) ) )
-    # When modifying, be very aware of inheritance hierarchy and effects it has
-    # on the order of below.
-    translate_type.map = (
-        ( 'TEXT', (
-            ( datastore_types.Key,        lambda v: str(v)                   ),
-            # Map 8 bit data using a codepage that defines every value.
-            ( datastore_types.ByteString, lambda v: v.decode('iso8859-1')    ),
-            ( datastore_types.IM,         lambda v: unicode(v)               ),
-            ( users.User,                 lambda v: v.email()                ),
-            ( datastore_types.GeoPt,      lambda v: '%s:%s' % (v.lat, v.lon) ),
-            ( str,                        lambda v: v.decode('iso8859-1')    ),
-            ( unicode,                    lambda v: v                        ),
-        ), ),
-        ( 'DATETIME', (
-            ( datetime,                   lambda v: v.strftime(
-                                                       '%Y-%m-%d %H:%M:%S')  ),
-            ( time,                       lambda v: v.strftime(
-                                                       '01-01-1970 %H:%M:%S')),
-            ( date,                       lambda v: v.strftime(
-                                                       '%Y-%m-%d %H:%M:%S')  ),
-        ), ),
-        ( 'INTEGER', (
-            # int catches bool too.
-            ( int,                        lambda v: long(v)                  ),
-            # catching Rating too.
-            ( long,                       lambda v: long(v)                  ),
-        ), ),
-        ( 'REAL', (
-            ( float,                      lambda v: v                        ),
-        ), ),
-    )
+        map[klass.__name__] = klass, table_name, props
+    return map
 
 
-def sync_model(db, models):
+def sync_model(sql, models):
     '''
     Given a list of 
     '''
 
-    c = db.cursor()
+    map = get_model_map(models)
+    c = sql.cursor()
 
     tables = set(r[0] for r in c.execute('SELECT name '
                                          'FROM sqlite_master '
@@ -259,34 +292,45 @@ def sync_model(db, models):
                                         "WHERE type = 'view'").fetchall())
 
     # Update fact and property tables first.
-    new_fact_tables = []
-    new_prop_tables = []
+    for klass_name, (klass, table_name, props) in map.iteritems():
+        if table_name not in tables:
+            c.execute('CREATE TABLE %s(id INT NOT NULL)' % (table_name,))
+            logging.info('created %s for Model %s', table_name, klass_name)
 
-    for klass in models:
-        table = translate_name(klass.__name__)
-        if table not in tables:
-           new_fact_tables.append((klass, table))
+        for prop_name, bits in props.iteritems():
+            prop, prop_table_name, sql_type, translator = bits
+            if prop_table_name in tables:
+                continue
 
-        for prop_name, prop in klass.properties().iteritems():
-            table = translate_name(klass.__name__, prop_name)
-            if table not in tables:
-                new_prop_tables.append((klass, prop_name, prop, table))
+            c.execute('CREATE TABLE %s ('
+                        '%s_id INTEGER NOT NULL UNIQUE,'
+                        'value %s'
+                      ')' % (prop_table_name, table_name, sql_type))
+            logging.info('created %s for %s.%s', prop_table_name,
+                                                 klass_name, prop_name)
 
-    logging.info('About to create %d fact tables and %d property tables.',
-                 len(new_fact_tables), len(new_prop_tables))
+        # Update VIEW definitions. Drop the old one first in case any columns
+        # have been added or removed.
+        if table_name + '_view' in views:
+            c.execute('DROP VIEW %s_view' % (table_name,))
+            logging.debug('dropped existing view %s_view', table_name)
 
-    for klass, table in new_fact_tables:
-        c.execute('CREATE TABLE %s(id INT NOT NULL)' % (table,))
-        logging.info('-- created %s for Model %s', table, klass.__name__)
+        fields = []
+        joins = [ table_name ]
 
-    for klass, prop_name, prop, table in new_prop_tables:
-        try:
-            sql_type, translator = translate_type(prop.data_type)
-        except TypeError, e:
-            logging.error('unable to create property table for %s.%s: %s',
-                          klass.__name__, prop_name, e)
-            db.rollback()
-            raise SystemExit(1)
+        for prop_name, bits in props.iteritems():
+            prop, prop_table_name, sql_type, translator = bits
+            fields.append('%s.value AS %s' %
+                          (prop_table_name, translate_name(prop_name)))
+            joins.append('%s ON(%s.%s_id = %s.id)' %
+                         (prop_table_name, prop_table_name,
+                          table_name, table_name))
+
+        c.execute('CREATE VIEW %s_view AS SELECT %s FROM %s' %
+                  (table_name,
+                   ', '.join(fields),
+                   ' LEFT JOIN '.join(joins)))
+        logging.info('created view %s_view', table_name)
 
 
 #
@@ -361,13 +405,15 @@ def main():
         usage('could not locate AppEngine SDK modules. Traceback below.')
         traceback.print_last()
 
+    logging.basicConfig(level=logging.DEBUG)
+
     app_name = None
     email = None
     password = None
     remote_path = '/remote_api'
     lib_paths = []
     model_modules = []
-    db_path = './models.sqlite3'
+    sql_path = './models.sqlite3'
     exclude_models = []
 
     try:
@@ -391,7 +437,7 @@ def main():
         elif opt == '-m':
             model_modules.append(optarg)
         elif opt == '-d':
-            db_path = optarg
+            sql_path = optarg
         elif opt == '-x':
             exclude_models.append(optarg)
         else:
@@ -429,7 +475,7 @@ def main():
 
     # Initialize the database connection.
     try:
-        db = sqlite3.connect(db_path)
+        sql = sqlite3.connect(sql_path)
     except sqlite3.OperationalError, e:
         logging.error('could not open database: %s', e)
         return 1
@@ -439,13 +485,13 @@ def main():
 
     # Local-only commands:
     if command == 'sync':
-        sync_model(db, models)
+        sync_model(sql, models)
     elif command == 'orphaned':
-        print_orphaned(db, models)
+        print_orphaned(sql, models)
     elif command == 'prune':
-        prune_orphaned(db, models)
+        prune_orphaned(sql, models)
     elif command == 'fetch':
-        fetch(db, models)
+        fetch(sql, models)
     else:
         assert False
 
