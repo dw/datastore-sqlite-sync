@@ -719,8 +719,8 @@ def usage(msg=None):
         '  -L <path>    Prepend extra path to module search path\n'
         '  -m <name>    Load Model classes from module\n'
         '  -d <path>    Local database path (default "./models.sqlite3")\n'
-        '  -x <name>    Exclude the given Module class\n'
-        '  -N <count>   Number of fetch worker threads (default: 10)\n'
+        '  -x <name>    Exclude the given Model class\n'
+        '  -N <count>   Number of fetch worker threads (default: 5)\n'
         '  -C <count>   Number of entities to fetch per request (default: 50)\n'
         '  -v           Verbose/debug output\n'
         '\n'
@@ -781,7 +781,7 @@ def main():
     sql_path = './models.sqlite3'
     exclude_models = []
     level = logging.INFO
-    worker_count = 10
+    worker_count = 5
     batch_size = 50
 
     try:
