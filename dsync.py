@@ -4,7 +4,7 @@
 Synchronize the contents of a Google AppEngine Datastore to a local SQLite3
 database.
 
-Maintains an SQLite database constructs like so:
+Maintains an SQLite database constructed like so:
 
     Table <model_class_name>: ModelClassName
         id:     Automatically generated integer.
@@ -22,11 +22,16 @@ Maintains an SQLite database constructs like so:
         property_name:  model_class_name_property_name.value
         ...
 
+Invoking any command will automatically add new table definitions to the
+database, if any, to the database, and recreate its views.
+
 Fact and property table names are mapped from Python model class names
 and property identifiers such that "CamelCase" becomes "camel_case," 
 "dromedaryCase" becomes "dromedary_case", and "python_case" remains the
-unchanged. For convenience, view names are not translated.
+unchanged.
 '''
+
+from __future__ import with_statement
 
 import getopt
 import inspect
@@ -35,6 +40,7 @@ import os
 import sqlite3
 import sys
 import traceback
+import threading
 
 from datetime import date, datetime, time
 
@@ -109,6 +115,16 @@ def init_sdk_env(app_name, email, password, remote_path='/remote_api'):
 # Program implementation.
 #
 
+class Bag(dict):
+    __getattr__ = dict.__getitem__
+
+class ModelInfo(Bag):
+    'SQL mapping information for a google.appengine.ext.db.Model subclass.'
+
+class PropertyInfo(Bag):
+    'SQL mapping information for a google.appengine.ext.db.Property instance.'
+
+
 def translate_type(typ):
     '''
     Given a Python type, or one of the extended AppEngine type classes,
@@ -116,7 +132,7 @@ def translate_type(typ):
     this type should be mapped to.
 
     The type parameter comes from the Property class's data_type class
-    variable.
+    variable, except for ReferenceProperties, where it is assumed to be Key.
 
     Returns a tuple whose first item is a string with the SQL data type, and
     second item is a function that when called on a value of this type,
@@ -258,17 +274,18 @@ def get_model_map(models):
     information mapping their properties to SQL.
 
     @param[in]  models      Sequence of Model subclasses.
-    @returns                Complex structure. See code.
+    @returns                List of ModelInfo objects, see code.
     '''
 
-    model_map = {}
+    infos = []
 
     for klass in models:
-        table_name = translate_name(klass.__name__)
-        props = {}
+        info = ModelInfo(klass=klass, name=klass.__name__,
+                         table=translate_name(klass.__name__), props=[],
+                         now_prop=None)
 
-        for prop_name, prop in klass.properties().iteritems():
-            prop_table_name = translate_name(table_name, prop_name)
+        for prop in klass.properties().itervalues():
+            prop_table_name = translate_name(info.table, prop.name)
             # TODO(dmw): seems like a bug in the SDK. data_type should be
             # Key, not Model.
             if isinstance(prop, db.ReferenceProperty):
@@ -279,14 +296,23 @@ def get_model_map(models):
             try:
                 sql_type, translator = translate_type(typ)
             except TypeError, e:
-                logging.error('%s.%s: %s', klass.__name__, prop_name, e)
+                logging.error('%s.%s: %s', klass.__name__, prop.name, e)
                 raise
 
-            props[prop_name] = prop, prop_table_name, sql_type, translator
+                return prop
 
-        model_map[klass.__name__] = klass, table_name, props
+            prop_info = PropertyInfo(prop=prop, name=prop.name,
+                                     table=prop_table_name,
+                                     sql_type=sql_type,
+                                     translator=translator)
 
-    return model_map
+            info.props.append(prop_info)
+            if isinstance(prop, db.DateTimeProperty) and prop.auto_now:
+                info.now_prop = prop_info
+
+        infos.append(info)
+
+    return infos
 
 
 def get_tables_views(sql):
@@ -310,67 +336,71 @@ def get_tables_views(sql):
     return tables, views
 
 
-def sync_model(sql, model_map):
+def sync_model(sql, infos):
     '''
     Given a database connection and mapping of Model subclasses to SQL types,
     add any missing tables and views to the database schema.
 
-    @param[in]  sql         DBAPI connection object.
-    @param[in]  model_map   Model mapping created by get_model_map().
+    @param[in]  sql     DBAPI connection object.
+    @param[in]  infos   Output of get_model_map().
     '''
 
     tables, views = get_tables_views(sql)
     c = sql.cursor()
 
-    # Update fact and property tables first.
-    for klass_name, (klass, table_name, props) in model_map.iteritems():
-        if table_name not in tables:
-            c.execute('CREATE TABLE %s(id INT NOT NULL)' % (table_name,))
-            logging.info('created %s for Model %s', table_name, klass_name)
+    for info in infos:
+        # Update fact and property tables first.
+        if info.table not in tables:
+            c.execute('CREATE TABLE %s ('
+                        'id INT NOT NULL,'
+                        'ds_key TEXT NOT NULL)'
+                        % (info.table,))
+            logging.info('created %s for Model %s', info.table, info.name)
 
-        for prop_name, bits in props.iteritems():
-            prop, prop_table_name, sql_type, translator = bits
-            if prop_table_name in tables:
+        for prop_info in info.props:
+            if prop_info.table in tables:
                 continue
 
             c.execute('CREATE TABLE %s ('
                         '%s_id INTEGER NOT NULL UNIQUE,'
                         'value %s'
-                      ')' % (prop_table_name, table_name, sql_type))
-            logging.info('created %s for %s.%s', prop_table_name,
-                                                 klass_name, prop_name)
+                      ')' % (prop_info.table, info.table,
+                             prop_info.sql_type))
+            logging.info('created %s for %s.%s', prop_info.table,
+                                                 info.name, prop_info.name)
 
-        # Update VIEW definitions. Drop the old one first in case any columns
-        # have been added or removed.
-        if table_name + '_view' in views:
-            c.execute('DROP VIEW %s_view' % (table_name,))
-            logging.debug('dropped existing view %s_view', table_name)
+    # Update VIEW definitions after, in order to avoid referencing tables that
+    # don't yet exit. Drop any old one first in case columns have been added or
+    # removed.
+    for info in infos:
+        if info.table + '_view' in views:
+            c.execute('DROP VIEW %s_view' % (info.table,))
+            logging.debug('dropped existing view %s_view', info.table)
 
         fields = []
-        joins = [ table_name ]
+        joins = [ info.table ]
 
-        for prop_name, bits in props.iteritems():
-            prop, prop_table_name, sql_type, translator = bits
+        for prop_info in info.props:
             fields.append('%s.value AS %s' %
-                          (prop_table_name, translate_name(prop_name)))
+                          (prop_info.table, translate_name(prop_info.name)))
             joins.append('%s ON(%s.%s_id = %s.id)' %
-                         (prop_table_name, prop_table_name,
-                          table_name, table_name))
+                         (prop_info.table, prop_info.table,
+                          info.table, info.table))
 
         c.execute('CREATE VIEW %s_view AS SELECT %s FROM %s' %
-                  (table_name,
+                  (info.table,
                    ', '.join(fields),
                    ' LEFT JOIN '.join(joins)))
-        logging.debug('created view %s_view', table_name)
+        logging.debug('created view %s_view', info.table)
 
 
-def get_orphaned(sql, model_map):
+def get_orphaned(sql, infos):
     '''
     Return a tuple of sets of table and view names that have no corresopnding
-    Model subclasses or properties in the given model_map.
+    Model subclasses or properties in the given set of models.
 
     @param[in]  sql         DBAPI connection objet.
-    @param[in]  model_map   Model mapping created by get_model_map().
+    @param[in]  infos       Output of get_model_map().
     @returns                (orphaned-tables, orphaned-views)
     '''
 
@@ -379,26 +409,26 @@ def get_orphaned(sql, model_map):
     active_tables = set()
     active_views = set()
 
-    for _, (_, table_name, props) in model_map.iteritems():
-        active_tables.add(table_name)
-        active_views.add(table_name + '_view')
-        for _, table_name, _, _ in props.itervalues():
-            active_tables.add(table_name)
+    for info in infos:
+        active_tables.add(info.table)
+        active_views.add(info.table + '_view')
+        for prop_info in info.props:
+            active_tables.add(prop_info.table)
 
     return tables.difference(active_tables), \
            views.difference(active_views)
 
 
-def print_orphaned(sql, model_map):
+def print_orphaned(sql, infos):
     '''
     Output a list of tables and views that have no corresponding Model
     subclasses or properties in the given model_map.
 
-    @param[in]  sql         DBAPI connection objet.
-    @param[in]  model_map   Model mapping created by get_model_map().
+    @param[in]  sql     DBAPI connection objet.
+    @param[in]  infos   Output of get_model_map().
     '''
 
-    tables, views = get_orphaned(sql, model_map)
+    tables, views = get_orphaned(sql, infos)
 
     if not (tables or views):
         logging.info('no orphans.')
@@ -415,16 +445,16 @@ def print_orphaned(sql, model_map):
             logging.info('  %s', view_name)
 
 
-def prune_orphaned(sql, model_map):
+def prune_orphaned(sql, infos):
     '''
     Delete any tables and views that have no corresponding Model subclasses or
-    properties in the given model_map.
+    properties in the given set of models.
 
-    @param[in]  sql         DBAPI connection object.
-    @param[in]  model_map   Model mapping created by get_model_map().
+    @param[in]  sql     DBAPI connection object.
+    @param[in]  infos   Output of get_model_map().
     '''
 
-    tables, views = get_orphaned(sql, model_map)
+    tables, views = get_orphaned(sql, infos)
     c = sql.cursor()
 
     for table_name in tables:
@@ -438,60 +468,151 @@ def prune_orphaned(sql, model_map):
     logging.info('deleted %d objects total.', sum(map(len, [tables, views])))
 
 
-def get_model_modes(model_map):
+def get_highest_date(sql, info):
     '''
-    Analyse the model definitions to figure out which mode should be used to
-    synchronize them, i.e. query by auto_now field or __key__.
+    Fetch the highest recorded auto_now date from the given table. If no date
+    can be found, just return a really old date instead.
 
-    @param[in]  model_map   Model mapping created by get_model_map().
-    @returns    Mapping of model name to None if using __key__, or tuple of
-                (prop_name, prop) if using auto_now.
+    @param[in]  sql         DBAPI connection object.
+    @param[in]  info        ModelInfo instance.
+    @returns                datetime.datetime instance.
     '''
 
-    modes = {}
+    assert info.now_prop
 
-    for klass_name, (klass, table_name, props) in model_map.iteritems():
-        auto_now_prop = None
+    # TODO(dmw): make this not do a scan.
+    c = sql.cursor()
 
-        for prop_name, bits in props.iteritems():
-            prop, prop_table_name, sql_type, translator = bits
-            if not isinstance(prop, db.DateTimeProperty):
-                continue
+    highest = datetime(1970, 1, 1)
+    for value, in c.execute('SELECT value FROM ' + info.now_prop.table):
+        # TODO(dmw): verify type coming back from DBAPI.
+        raise NotImplemented
+        highest = max(highest, value)
 
-            if not prop.auto_now:
-                continue
+    return highest
 
-            if not auto_now_prop:
-                 auto_now_prop = prop_name
-                 continue
 
-            # Since there is no way to get a robust definition of the 'first'
-            # auto-now property if there are more than one in a subclass, we
-            # give up and just do __key__ on that subclass instead. This is
-            # because it's possible for the order in which they're returned to
-            # us may change simply by adding extra properties to the subclass
-            # (potentially causing a rehash of the class dictionary).
-            # TODO(dmw): can we do better?
-            logging.error('Model %s has multiple auto_now properties!',
-                          klass_name)
-            logging.error('Using __key__ for %s to avoid weirdness.',
-                          klass_name)
-            auto_now_prop = None
+def get_highest_key(sql, info):
+    '''
+    Fetch the highest recorded key from the given table. If no key can be
+    found, returns None.
+
+    @param[in]  sql         DBAPI connection object.
+    @param[in]  info        ModelInfo instance.
+    @returns                appengine.ext.db.Key instance or None.
+    '''
+
+    # TODO(dmw): make this not do a scan.
+    c = sql.cursor()
+
+    highest = None
+    for ds_key, in c.execute('SELECT ds_key FROM ' + info.table):
+        highest = max(highest, db.Key(ds_key))
+
+    return highest
+
+
+def save_entity(sql, info, entity):
+    '''
+    Delete any existing entity from the database with the same key, then save
+    the given entity.
+
+    @param[in]  info        Associated ModelInfo instance.
+    @param[in]  entity      appengine.ext.db.Model instance.
+    '''
+
+    c = sql.cursor()
+    key = entity.key()
+
+    old_id = list(c.execute('SELECT id FROM %s WHERE ds_key = ?'
+                             % (info.table, ), (str(key), )))
+    if old_id:
+        c.execute('DELETE FROM %s WHERE id = ?' % (info.table,), old_id[0])
+
+    c.execute('INSERT INTO %s(ds_key) VALUES(?)' % (info.table,), (str(key),))
+    new_id = c.lastrowid
+
+    for prop in info.props:
+        if old_id:
+            c.execute('DELETE FROM %s WHERE %s_id = ?'
+                      % (prop.table, info.table), (old_id[0],))
+        value = prop.translator(prop.prop.get_value_for_datastore(entity))
+        c.execute('INSERT INTO %s(%s_id, value)' % (prop.table, info.table),
+                  (new_id, value))
+
+
+def save_entities(sql, info, entities):
+    '''
+    Save a set of Model instances retrieved from Datastore to the database,
+    possibly after deleting existing rows from the database with that share the
+    same key. Also update info.highest to include the highest seen key or date.
+
+    @param[in]  info        Associated ModelInfo instance.
+    @param[in]  entities    List of Model instances.
+    '''
+
+    c = sql.cursor()
+    c.execute('BEGIN')
+
+    for entity in entities:
+        save_entity(sql, info, entity)
+
+        if info.now_prop:
+            candidate = info.now_prop.prop.get_value_for_datastore(entity)
+            info.highest = max(info.highest, candidate)
+        else:
+            info.highest = max(info.highest, entity.key())
+
+    c.execute('COMMIT')
+
+
+def fetch_thread(lock, sql, get_next, batch_size):
+    '''
+    Fetch worker thread. Calls get_next() to get the next Model subclass
+    requiring replication, then repeatedly fetches small batches until no more
+    entities remain.
+
+    Thread exits when get_next() returns None.
+
+    @param[in]  lock        Lock to aquire when accessing DBAPI connection.
+    @param[in]  sql         DBAPI connection object.
+    @param[in]  get_next    Callback to invoke to get next table.
+    @param[in]  batch_size  Number entities to fetch per request.
+    '''
+
+    while True:
+        info = get_next()
+        if not info:
             break
 
-        if auto_now_prop:
-            modes[klass_name] = auto_now_prop, props[auto_now_prop]
-        else:
-            modes[klass_name] = None
+        logging.debug('beginning to process %s entities.', info.name)
 
-    return modes
+        while True:
+            query = info.klass.all()
+            if info.now_prop:
+                query.order(info.now_prop.name)
+                query.filter(info.now_prop.name + ' >', info.highest)
+            else:
+                query.order('__key__')
+                if info.highest:
+                    query.filter('__key__ >', info.highest)
+
+            entities = query.fetch(batch_size)
+            if not entities:
+                break
+
+            logging.debug('%s: got a batch of %d', info.name, len(entities))
+            with lock:
+                save_entities(sql, info, entities)
+
+    logging.debug('thread exiting; no more work.')
 
 
-def fetch(sql, model_map):
+def fetch(sql, infos, worker_count, batch_size):
     '''
     Fetch data from the AppEngine Datastore via remote_api and save it to the
-    local database. Synchronisation happens differently depending on the
-    properties of the particular Model subclass:
+    database. Synchronization happens differently depending on the properties
+    of the particular Model subclass:
 
         * For subclasses with a DateTimeProperty whose auto_now member is True,
           query the database for the maximum value of that property, then
@@ -501,16 +622,43 @@ def fetch(sql, model_map):
           value, then iteratively fetch entities with a higher __key__ value
           using an index query.
 
-    @param[in]  sql         DBAPI connection object.
-    @param[in]  model_map   Model mapping created by get_model_map().
+    @param[in]  sql             DBAPI connection object.
+    @param[in]  infos           Output of get_model_map().
+    @param[in]  worker_count    Number of worker threads to use.
+    @param[in]  batch_size      Number entities to fetch per request.
     '''
 
-    sync_model(sql, model_map)
-    modes = get_model_modes(model_map)
+    sync_model(sql, infos)
 
-    from pprint import pprint
-    pprint(modes)
+    lock = threading.Lock()
+    to_check = infos[:]
+    end_event = threading.Event()
+    end_count = [0]
 
+    logging.debug('got %d tables to check.', len(to_check))
+
+    def get_next():
+        with lock:
+            if to_check:
+                return to_check.pop(-1)
+
+    def safe_fetch_thread(*args):
+        try:
+            fetch_thread(*args)
+        except:
+            traceback.print_exc()
+
+        with lock: end_count[0] += 1
+        if end_count[0] == worker_count:
+            end_event.set()
+
+    for i in range(worker_count):
+        thread = threading.Thread(target=safe_fetch_thread,
+                                  args=(lock, sql, get_next, batch_size))
+        thread.start()
+
+    end_event.wait()
+    logging.debug('all fetch threads done; finished.')
 
 
 #
@@ -530,13 +678,9 @@ def usage(msg=None):
         '  -m <name>    Load Model classes from module\n'
         '  -d <path>    Local database path (default "./models.sqlite3")\n'
         '  -x <name>    Exclude the given Module class\n'
+        '  -N <count>   Number of fetch worker threads (default: 10)\n'
+        '  -C <count>   Number of entities to fetch per request (default: 50)\n'
         '  -v           Verbose/debug output\n'
-        '\n'
-        'Commands:\n'
-        '  sync\n'
-        '    Create local database if it does not exist, then add or\n'
-        '    update its tables and views with any newly discovered\n'
-        '    model properties.\n'
         '\n'
         '  fetch\n'
         '    Start fetching data from Datastore to local database.\n'
@@ -563,7 +707,7 @@ def usage(msg=None):
         '    except for RemoteUrlCacheEntry:\n'
         '\n'
         '        %s -L $HOME/src -m myapp.models -m myapp.counters \\\n'
-        '            -d $HOME/myapp.db -x RemoteUrlCacheEntry\\\n'
+        '            -d $HOME/myapp.db -x RemoteUrlCacheEntry \\\n'
         '            -a myapp -e me@gmail.com -p 1234 \\\n'
         '            fetch\n'
         '\n'
@@ -595,9 +739,11 @@ def main():
     sql_path = './models.sqlite3'
     exclude_models = []
     level = logging.INFO
+    worker_count = 10
+    batch_size = 50
 
     try:
-        optlist = 'a:e:p:r:L:m:d:x:v'
+        optlist = 'a:e:p:r:L:m:d:x:vN:C:'
         opts, args = getopt.gnu_getopt(sys.argv[1:], optlist)
     except getopt.GetoptError, e:
         usage(str(e))
@@ -622,6 +768,22 @@ def main():
             exclude_models.append(optarg)
         elif opt == '-v':
             level = logging.DEBUG
+        elif opt == '-N':
+            try:
+                worker_count = int(optarg, 10)
+                if worker_count < 1:
+                    raise ValueError('must be >= 1')
+            except ValueError, e:
+                usage('Bad -N: ' + str(e))
+                return 1
+        elif opt == '-C':
+            try:
+                batch_size = int(optarg, 10)
+                if batch_size < 1:
+                    raise ValueError('must be >= 1')
+            except ValueError, e:
+                usage('Bad -C: ' + str(e))
+                return 1
         else:
             assert False
 
@@ -657,10 +819,6 @@ def main():
             return 1
         init_sdk_env(app_name, email, password, remote_path)
 
-    # Perform any common initializations here.
-    build_translate_type_map()
-    model_map = get_model_map(models)
-
     # Initialize the database connection.
     try:
         sql = sqlite3.connect(sql_path)
@@ -668,15 +826,23 @@ def main():
         logging.error('could not open database: %s', e)
         return 1
 
+    # Perform any common initializations here.
+    build_translate_type_map()
+    infos = get_model_map(models)
+    sync_model(sql, infos)
+    for info in infos:
+        if info.now_prop:
+            info.highest = get_highest_date(sql, info)
+        else:
+            info.highest = get_highest_key(sql, info)
+
     # Local-only commands:
-    if command == 'sync':
-        sync_model(sql, model_map)
-    elif command == 'orphaned':
-        print_orphaned(sql, model_map)
+    if command == 'orphaned':
+        print_orphaned(sql, infos)
     elif command == 'prune':
-        prune_orphaned(sql, model_map)
+        prune_orphaned(sql, infos)
     elif command == 'fetch':
-        fetch(sql, model_map)
+        fetch(sql, infos, worker_count, batch_size)
     else:
         assert False
 
