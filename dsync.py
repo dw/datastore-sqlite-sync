@@ -100,7 +100,7 @@ def init_sdk_env(app_name, email, password, remote_path='/remote_api'):
     '''
 
     os.environ['AUTH_DOMAIN'] = 'gmail.com'
-    ov.environ['USER_EMAIL'] = email
+    os.environ['USER_EMAIL'] = email
     remote_api_stub.ConfigureRemoteDatastore(app_name, remote_path,
                                              lambda: (email, password))
 
@@ -148,7 +148,7 @@ def build_translate_type_map():
     translate_type.map = (
         ( 'TEXT', (
             ( datastore_types.Key, lambda v: str(v) ),
-            # model_map 8 bit data using a codepage that defines every value.
+            # Map 8 bit data using a codepage that defines every value.
             ( datastore_types.ByteString, lambda v: v.decode('iso8859-1') ),
             ( datastore_types.IM, lambda v: unicode(v) ),
             ( users.User, lambda v: v.email() ),
@@ -361,7 +361,7 @@ def sync_model(sql, model_map):
                   (table_name,
                    ', '.join(fields),
                    ' LEFT JOIN '.join(joins)))
-        logging.info('created view %s_view', table_name)
+        logging.debug('created view %s_view', table_name)
 
 
 def get_orphaned(sql, model_map):
@@ -420,7 +420,7 @@ def prune_orphaned(sql, model_map):
     Delete any tables and views that have no corresponding Model subclasses or
     properties in the given model_map.
 
-    @param[in]  sql         DBAPI connection objet.
+    @param[in]  sql         DBAPI connection object.
     @param[in]  model_map   Model mapping created by get_model_map().
     '''
 
@@ -436,6 +436,81 @@ def prune_orphaned(sql, model_map):
         logging.info('Dropped %s', view_name)
 
     logging.info('deleted %d objects total.', sum(map(len, [tables, views])))
+
+
+def get_model_modes(model_map):
+    '''
+    Analyse the model definitions to figure out which mode should be used to
+    synchronize them, i.e. query by auto_now field or __key__.
+
+    @param[in]  model_map   Model mapping created by get_model_map().
+    @returns    Mapping of model name to None if using __key__, or tuple of
+                (prop_name, prop) if using auto_now.
+    '''
+
+    modes = {}
+
+    for klass_name, (klass, table_name, props) in model_map.iteritems():
+        auto_now_prop = None
+
+        for prop_name, bits in props.iteritems():
+            prop, prop_table_name, sql_type, translator = bits
+            if not isinstance(prop, db.DateTimeProperty):
+                continue
+
+            if not prop.auto_now:
+                continue
+
+            if not auto_now_prop:
+                 auto_now_prop = prop_name
+                 continue
+
+            # Since there is no way to get a robust definition of the 'first'
+            # auto-now property if there are more than one in a subclass, we
+            # give up and just do __key__ on that subclass instead. This is
+            # because it's possible for the order in which they're returned to
+            # us may change simply by adding extra properties to the subclass
+            # (potentially causing a rehash of the class dictionary).
+            # TODO(dmw): can we do better?
+            logging.error('Model %s has multiple auto_now properties!',
+                          klass_name)
+            logging.error('Using __key__ for %s to avoid weirdness.',
+                          klass_name)
+            auto_now_prop = None
+            break
+
+        if auto_now_prop:
+            modes[klass_name] = auto_now_prop, props[auto_now_prop]
+        else:
+            modes[klass_name] = None
+
+    return modes
+
+
+def fetch(sql, model_map):
+    '''
+    Fetch data from the AppEngine Datastore via remote_api and save it to the
+    local database. Synchronisation happens differently depending on the
+    properties of the particular Model subclass:
+
+        * For subclasses with a DateTimeProperty whose auto_now member is True,
+          query the database for the maximum value of that property, then
+          iteratively fetch updated entities using an index query.
+
+        * For other subclasses, query the database for the highest __key__
+          value, then iteratively fetch entities with a higher __key__ value
+          using an index query.
+
+    @param[in]  sql         DBAPI connection object.
+    @param[in]  model_map   Model mapping created by get_model_map().
+    '''
+
+    sync_model(sql, model_map)
+    modes = get_model_modes(model_map)
+
+    from pprint import pprint
+    pprint(modes)
+
 
 
 #
