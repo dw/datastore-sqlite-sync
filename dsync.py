@@ -359,7 +359,7 @@ def sync_model(sql, infos):
         # Update fact and property tables first.
         if info.table not in tables:
             c.execute('CREATE TABLE %s ('
-                        'id PRIMARY KEY,'
+                        'id INTEGER PRIMARY KEY,'
                         'ds_key TEXT NOT NULL)'
                         % (info.table,))
             logging.debug('created %s for Model %s', info.table, info.name)
@@ -542,8 +542,10 @@ def save_entity(sql, info, entity):
         c.execute('DELETE FROM %s WHERE id = ?' % (info.table,), (old_id,))
         logging.debug('deleted old row from %s id=%s', info.table, old_id)
 
-    c.execute('INSERT INTO %s(ds_key) VALUES(?)' % (info.table,), (str(key),))
+    c.execute('INSERT INTO %s(id, ds_key) VALUES(NULL, ?)' % (info.table,),
+              (str(key),))
     new_id = c.lastrowid
+    assert c.lastrowid
 
     for prop in info.props:
         if old_id is not None:
@@ -664,7 +666,7 @@ def fetch(sql_factory, infos, worker_count, batch_size):
     to_check = infos[:]
     end_event = threading.Event()
     end_count = [0]
-    stats = dict(added=0, updated=0)
+    stats = dict(added=0, updated=0, models=0)
 
     logging.debug('got %d tables to check.', len(to_check))
 
@@ -672,9 +674,10 @@ def fetch(sql_factory, infos, worker_count, batch_size):
         with lock:
             stats['added'] += added
             stats['updated'] += updated
+            stats['models'] += 1
             if added or updated:
-                logging.info('%s done. Overall status: %s added, %s updated.',
-                             last_info.name, stats['added'], stats['updated'])
+                logging.info('%s done: %s added, %s updated.',
+                             last_info.name, added, updated)
             if to_check:
                 return to_check.pop(-1)
 
@@ -694,8 +697,8 @@ def fetch(sql_factory, infos, worker_count, batch_size):
         thread.start()
 
     end_event.wait()
-    logging.info('grand total: %s added, %s updated.',
-                 stats['added'], stats['updated'])
+    logging.info('grand total: %s added, %s updated in %s models.',
+                 stats['added'], stats['updated'], stats['models'])
     logging.debug('all fetch threads done; finished.')
 
 
