@@ -127,7 +127,7 @@ def translate_type(typ):
     @raises     TypeError   Type cannot be translated to SQL.
     '''
 
-    for sql_type, rules in translate_type.map:
+    for sql_type, rules in translate_type.model_map:
         for klass, translator in rules:
             if issubclass(typ, klass):
                 return sql_type, translator
@@ -145,10 +145,10 @@ def build_translate_type_map():
     # ( 'DestSqlType' -> ( (issubclass, translator), ), )
     # When modifying, be very aware of inheritance hierarchy and effects it
     # has on the order of below.
-    translate_type.map = (
+    translate_type.model_map = (
         ( 'TEXT', (
             ( datastore_types.Key, lambda v: str(v) ),
-            # Map 8 bit data using a codepage that defines every value.
+            # model_map 8 bit data using a codepage that defines every value.
             ( datastore_types.ByteString, lambda v: v.decode('iso8859-1') ),
             ( datastore_types.IM, lambda v: unicode(v) ),
             ( users.User, lambda v: v.email() ),
@@ -261,7 +261,7 @@ def get_model_map(models):
     @returns                Complex structure. See code.
     '''
 
-    map = {}
+    model_map = {}
 
     for klass in models:
         table_name = translate_name(klass.__name__)
@@ -284,9 +284,9 @@ def get_model_map(models):
 
             props[prop_name] = prop, prop_table_name, sql_type, translator
 
-        map[klass.__name__] = klass, table_name, props
+        model_map[klass.__name__] = klass, table_name, props
 
-    return map
+    return model_map
 
 
 def get_tables_views(sql):
@@ -310,20 +310,20 @@ def get_tables_views(sql):
     return tables, views
 
 
-def sync_model(sql, map):
+def sync_model(sql, model_map):
     '''
     Given a database connection and mapping of Model subclasses to SQL types,
     add any missing tables and views to the database schema.
 
-    @param[in]  sql     DBAPI connection object.
-    @param[in]  map     Model mapping created by get_model_map().
+    @param[in]  sql         DBAPI connection object.
+    @param[in]  model_map   Model mapping created by get_model_map().
     '''
 
-    tables, tables = get_tables_views(sql)
+    tables, views = get_tables_views(sql)
     c = sql.cursor()
 
     # Update fact and property tables first.
-    for klass_name, (klass, table_name, props) in map.iteritems():
+    for klass_name, (klass, table_name, props) in model_map.iteritems():
         if table_name not in tables:
             c.execute('CREATE TABLE %s(id INT NOT NULL)' % (table_name,))
             logging.info('created %s for Model %s', table_name, klass_name)
@@ -364,13 +364,14 @@ def sync_model(sql, map):
         logging.info('created view %s_view', table_name)
 
 
-def print_orphaned(sql, map):
+def get_orphaned(sql, model_map):
     '''
-    Output a list of tables that have no corresponding Model subclasses or
-    properties in the given map.
+    Return a tuple of sets of table and view names that have no corresopnding
+    Model subclasses or properties in the given model_map.
 
-    @param[in]  sql     DBAPI connection objet.
-    @param[in]  map     Model mapping created by get_model_map().
+    @param[in]  sql         DBAPI connection objet.
+    @param[in]  model_map   Model mapping created by get_model_map().
+    @returns                (orphaned-tables, orphaned-views)
     '''
 
     tables, views = get_tables_views(sql)
@@ -378,26 +379,63 @@ def print_orphaned(sql, map):
     active_tables = set()
     active_views = set()
 
-    for _, (_, table_name, props) in map.iteritems():
+    for _, (_, table_name, props) in model_map.iteritems():
         active_tables.add(table_name)
         active_views.add(table_name + '_view')
         for _, table_name, _, _ in props.itervalues():
             active_tables.add(table_name)
 
-    orphaned_tables = tables.difference(active_tables)
-    if orphaned_tables:
+    return tables.difference(active_tables), \
+           views.difference(active_views)
+
+
+def print_orphaned(sql, model_map):
+    '''
+    Output a list of tables and views that have no corresponding Model
+    subclasses or properties in the given model_map.
+
+    @param[in]  sql         DBAPI connection objet.
+    @param[in]  model_map   Model mapping created by get_model_map().
+    '''
+
+    tables, views = get_orphaned(sql, model_map)
+
+    if not (tables or views):
+        logging.info('no orphans.')
+        return
+
+    if tables:
         logging.info('orphaned tables:')
-        for table_name in orphaned_tables:
+        for table_name in tables:
             logging.info('  %s', table_name)
 
-    orphaned_views = views.difference(active_views)
-    if orphaned_views:
+    if views:
         logging.info('orphaned views:')
-        for view_name in orphaned_views:
+        for view_name in views:
             logging.info('  %s', view_name)
 
-    if not (orphaned_tables or orphaned_views):
-        logging.info('no orphans.')
+
+def prune_orphaned(sql, model_map):
+    '''
+    Delete any tables and views that have no corresponding Model subclasses or
+    properties in the given model_map.
+
+    @param[in]  sql         DBAPI connection objet.
+    @param[in]  model_map   Model mapping created by get_model_map().
+    '''
+
+    tables, views = get_orphaned(sql, model_map)
+    c = sql.cursor()
+
+    for table_name in tables:
+        c.execute('DROP TABLE ' + table_name)
+        logging.info('Dropped %s', table_name)
+
+    for view_name in views:
+        c.execute('DROP VIEW ' + view_name)
+        logging.info('Dropped %s', view_name)
+
+    logging.info('deleted %d objects total.', sum(map(len, [tables, views])))
 
 
 #
@@ -546,7 +584,7 @@ def main():
 
     # Perform any common initializations here.
     build_translate_type_map()
-    map = get_model_map(models)
+    model_map = get_model_map(models)
 
     # Initialize the database connection.
     try:
@@ -557,13 +595,13 @@ def main():
 
     # Local-only commands:
     if command == 'sync':
-        sync_model(sql, map)
+        sync_model(sql, model_map)
     elif command == 'orphaned':
-        print_orphaned(sql, map)
+        print_orphaned(sql, model_map)
     elif command == 'prune':
-        prune_orphaned(sql, map)
+        prune_orphaned(sql, model_map)
     elif command == 'fetch':
-        fetch(sql, map)
+        fetch(sql, model_map)
     else:
         assert False
 
