@@ -27,7 +27,7 @@ database, if any, to the database, and recreate its views.
 
 Fact and property table names are mapped from Python model class names
 and property identifiers such that "CamelCase" becomes "camel_case," 
-"dromedaryCase" becomes "dromedary_case", and "python_case" remains the
+"dromedaryCase" becomes "dromedary_case", while "python_case" remains
 unchanged.
 '''
 
@@ -39,8 +39,8 @@ import logging
 import os
 import sqlite3
 import sys
-import traceback
 import threading
+import traceback
 
 from datetime import date, datetime, time
 
@@ -83,11 +83,13 @@ def load_appengine_modules():
     sys.path.insert(0, yaml_path)
     sys.path.insert(0, sdk_path)
 
+    global datastore
     global datastore_types
-    global users
     global db
+    global users
     global remote_api_stub
 
+    from google.appengine.api import datastore
     from google.appengine.api import datastore_types
     from google.appengine.api import users
     from google.appengine.ext import db
@@ -109,6 +111,11 @@ def init_sdk_env(app_name, email, password, remote_path='/remote_api'):
     os.environ['USER_EMAIL'] = email
     remote_api_stub.ConfigureRemoteDatastore(app_name, remote_path,
                                              lambda: (email, password))
+
+    # TODO(dmw): ensure remote_api is thread-safe.
+    # 'ping' /remote_api before firing up a bunch of threads, which seems to
+    # result in logging in multiple times.
+    datastore.Get([db.Key.from_path('NonExistent', 1337)])
 
 
 #
@@ -173,17 +180,17 @@ def build_translate_type_map():
             ( unicode, lambda v: v ),
             ( basestring, lambda v: unicode(v) ),
         ), ),
-        ( 'DATETIME', (
-            ( datetime, lambda v: v.strftime('%Y-%m-%d %H:%M:%S') ),
+        ( 'TIMESTAMP', (
+            ( datetime, lambda v: v and v.strftime('%Y-%m-%d %H:%M:%S') or None ),
             # TODO(dmw): what to do with these?
-            ( time,     lambda v: v.strftime('01-01-1970 %H:%M:%S') ),
-            ( date,     lambda v: v.strftime('%Y-%m-%d %H:%M:%S') ),
+            ( time, lambda v: v and v.strftime('01-01-1970 %H:%M:%S') or None ),
+            ( date, lambda v: v and v.strftime('%Y-%m-%d %H:%M:%S') or None ),
         ), ),
         ( 'INTEGER', (
             # int catches bool too.
-            ( int, lambda v: long(v) ),
+            ( int, lambda v: v and long(v) or None ),
             # catching Rating too.
-            ( long, lambda v: long(v) ),
+            ( long, lambda v: v and long(v) or None ),
         ), ),
         ( 'REAL', (
             ( float, lambda v: v ),
@@ -218,13 +225,13 @@ def get_models(lib_paths, module_names, exclude):
                 if inspect.isclass(obj) and issubclass(obj, db.Model):
                     klass_name = obj.__name__
                     if not obj.properties():
-                        logging.debug('ignoring %s from module %s: no properties.',
-                                      klass_name, name)
+                        logging.debug('ignoring %s.%s: no properties.',
+                                      name, klass_name)
                         continue
 
                     if klass_name in exclude:
-                        logging.debug('ignoring %s from module %s: excluded.',
-                                      klass_name, name)
+                        logging.debug('ignoring %s.%s: excluded.',
+                                      name, klass_name)
                         continue
 
                     models.add(obj)
@@ -352,10 +359,10 @@ def sync_model(sql, infos):
         # Update fact and property tables first.
         if info.table not in tables:
             c.execute('CREATE TABLE %s ('
-                        'id INT NOT NULL,'
+                        'id PRIMARY KEY,'
                         'ds_key TEXT NOT NULL)'
                         % (info.table,))
-            logging.info('created %s for Model %s', info.table, info.name)
+            logging.debug('created %s for Model %s', info.table, info.name)
 
         for prop_info in info.props:
             if prop_info.table in tables:
@@ -366,8 +373,8 @@ def sync_model(sql, infos):
                         'value %s'
                       ')' % (prop_info.table, info.table,
                              prop_info.sql_type))
-            logging.info('created %s for %s.%s', prop_info.table,
-                                                 info.name, prop_info.name)
+            logging.debug('created %s for %s.%s', prop_info.table,
+                                                  info.name, prop_info.name)
 
     # Update VIEW definitions after, in order to avoid referencing tables that
     # don't yet exit. Drop any old one first in case columns have been added or
@@ -484,9 +491,8 @@ def get_highest_date(sql, info):
     c = sql.cursor()
 
     highest = datetime(1970, 1, 1)
-    for value, in c.execute('SELECT value FROM ' + info.now_prop.table):
-        # TODO(dmw): verify type coming back from DBAPI.
-        raise NotImplemented
+    for value, in c.execute('SELECT value AS value FROM %s'
+                            % (info.now_prop.table,)):
         highest = max(highest, value)
 
     return highest
@@ -507,9 +513,15 @@ def get_highest_key(sql, info):
 
     highest = None
     for ds_key, in c.execute('SELECT ds_key FROM ' + info.table):
-        highest = max(highest, db.Key(ds_key))
+        key = db.Key(ds_key)
+        highest = max(highest or key, key)
 
     return highest
+
+
+def fetch_one_col(c, fmt, *args):
+    for value, in c.execute(fmt, args):
+        return value
 
 
 def save_entity(sql, info, entity):
@@ -523,22 +535,25 @@ def save_entity(sql, info, entity):
 
     c = sql.cursor()
     key = entity.key()
+    old_id = fetch_one_col(c, 'SELECT id FROM %s WHERE ds_key = ?'
+                               % (info.table, ), str(key))
 
-    old_id = list(c.execute('SELECT id FROM %s WHERE ds_key = ?'
-                             % (info.table, ), (str(key), )))
-    if old_id:
-        c.execute('DELETE FROM %s WHERE id = ?' % (info.table,), old_id[0])
+    if old_id is not None:
+        c.execute('DELETE FROM %s WHERE id = ?' % (info.table,), (old_id,))
+        logging.debug('deleted old row from %s id=%s', info.table, old_id)
 
     c.execute('INSERT INTO %s(ds_key) VALUES(?)' % (info.table,), (str(key),))
     new_id = c.lastrowid
 
     for prop in info.props:
-        if old_id:
+        if old_id is not None:
             c.execute('DELETE FROM %s WHERE %s_id = ?'
-                      % (prop.table, info.table), (old_id[0],))
+                      % (prop.table, info.table), (old_id, ))
         value = prop.translator(prop.prop.get_value_for_datastore(entity))
-        c.execute('INSERT INTO %s(%s_id, value)' % (prop.table, info.table),
-                  (new_id, value))
+        c.execute('INSERT INTO %s(%s_id, value) VALUES(?, ?)'
+                  % (prop.table, info.table), (new_id, value))
+
+    return old_id is not None
 
 
 def save_entities(sql, info, entities):
@@ -554,19 +569,26 @@ def save_entities(sql, info, entities):
     c = sql.cursor()
     c.execute('BEGIN')
 
+    added = 0
+    updated = 0
+
     for entity in entities:
-        save_entity(sql, info, entity)
+        if save_entity(sql, info, entity):
+            updated += 1
+        else:
+            added += 1
 
         if info.now_prop:
             candidate = info.now_prop.prop.get_value_for_datastore(entity)
-            info.highest = max(info.highest, candidate)
+            info.highest = max(info.highest or candidate, candidate)
         else:
-            info.highest = max(info.highest, entity.key())
+            info.highest = max(info.highest or entity.key(), entity.key())
 
     c.execute('COMMIT')
+    return added, updated
 
 
-def fetch_thread(lock, sql, get_next, batch_size):
+def fetch_thread(sql_factory, get_next, batch_size):
     '''
     Fetch worker thread. Calls get_next() to get the next Model subclass
     requiring replication, then repeatedly fetches small batches until no more
@@ -574,17 +596,23 @@ def fetch_thread(lock, sql, get_next, batch_size):
 
     Thread exits when get_next() returns None.
 
-    @param[in]  lock        Lock to aquire when accessing DBAPI connection.
-    @param[in]  sql         DBAPI connection object.
-    @param[in]  get_next    Callback to invoke to get next table.
-    @param[in]  batch_size  Number entities to fetch per request.
+    @param[in]  sql_factory     DBAPI connection factory.
+    @param[in]  get_next        Callback to invoke to get next table.
+    @param[in]  batch_size      Number entities to fetch per request.
     '''
 
+    sql = sql_factory()
+    info = None
+    added = 0
+    updated = 0
+
     while True:
-        info = get_next()
+        info = get_next(info, added, updated)
         if not info:
             break
 
+        added = 0
+        updated = 0
         logging.debug('beginning to process %s entities.', info.name)
 
         while True:
@@ -602,13 +630,14 @@ def fetch_thread(lock, sql, get_next, batch_size):
                 break
 
             logging.debug('%s: got a batch of %d', info.name, len(entities))
-            with lock:
-                save_entities(sql, info, entities)
+            added, updated = save_entities(sql, info, entities)
+            logging.debug('%s: added %d, updated %d.', info.name,
+                          added, updated)
 
     logging.debug('thread exiting; no more work.')
 
 
-def fetch(sql, infos, worker_count, batch_size):
+def fetch(sql_factory, infos, worker_count, batch_size):
     '''
     Fetch data from the AppEngine Datastore via remote_api and save it to the
     database. Synchronization happens differently depending on the properties
@@ -622,23 +651,30 @@ def fetch(sql, infos, worker_count, batch_size):
           value, then iteratively fetch entities with a higher __key__ value
           using an index query.
 
-    @param[in]  sql             DBAPI connection object.
+    @param[in]  sql_factory     DBAPI connection factory.
     @param[in]  infos           Output of get_model_map().
     @param[in]  worker_count    Number of worker threads to use.
     @param[in]  batch_size      Number entities to fetch per request.
     '''
 
+    sql = sql_factory()
     sync_model(sql, infos)
 
     lock = threading.Lock()
     to_check = infos[:]
     end_event = threading.Event()
     end_count = [0]
+    stats = dict(added=0, updated=0)
 
     logging.debug('got %d tables to check.', len(to_check))
 
-    def get_next():
+    def get_next(last_info, added, updated):
         with lock:
+            stats['added'] += added
+            stats['updated'] += updated
+            if added or updated:
+                logging.info('%s done. Overall status: %s added, %s updated.',
+                             last_info.name, stats['added'], stats['updated'])
             if to_check:
                 return to_check.pop(-1)
 
@@ -654,11 +690,14 @@ def fetch(sql, infos, worker_count, batch_size):
 
     for i in range(worker_count):
         thread = threading.Thread(target=safe_fetch_thread,
-                                  args=(lock, sql, get_next, batch_size))
+                                  args=(sql_factory, get_next, batch_size))
         thread.start()
 
     end_event.wait()
+    logging.info('grand total: %s added, %s updated.',
+                 stats['added'], stats['updated'])
     logging.debug('all fetch threads done; finished.')
+
 
 
 #
@@ -819,9 +858,31 @@ def main():
             return 1
         init_sdk_env(app_name, email, password, remote_path)
 
+    # SQLite3 requires one connection per thread, I require logging.
+    def sql_factory():
+        class LoggingCursor(sqlite3.Cursor):
+            def execute(self, fmt, args=None):
+                try:
+                    if args:
+                        return sqlite3.Cursor.execute(self, fmt, args)
+                    else:
+                        return sqlite3.Cursor.execute(self, fmt)
+                except:
+                    logging.error('failed sql was: %s %s', fmt, args)
+                    raise
+
+        class LoggingConnection(sqlite3.Connection):
+            def cursor(self):
+                return sqlite3.Connection.cursor(self, LoggingCursor)
+
+        return sqlite3.connect(sql_path, isolation_level=None,
+                               factory=LoggingConnection,
+                               detect_types=sqlite3.PARSE_DECLTYPES)
+
+
     # Initialize the database connection.
     try:
-        sql = sqlite3.connect(sql_path)
+        sql = sql_factory()
     except sqlite3.OperationalError, e:
         logging.error('could not open database: %s', e)
         return 1
@@ -842,7 +903,7 @@ def main():
     elif command == 'prune':
         prune_orphaned(sql, infos)
     elif command == 'fetch':
-        fetch(sql, infos, worker_count, batch_size)
+        fetch(sql_factory, infos, worker_count, batch_size)
     else:
         assert False
 
