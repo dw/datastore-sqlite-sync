@@ -383,7 +383,7 @@ def usage(msg=None):
         '\n'
         '        %s -L $HOME/src -m myapp.models -m myapp.counters \\\n'
         '            -d $HOME/myapp.db -x RemoteUrlCacheEntry\\\n'
-        '            -a myapp -e dw@botanicus.net -p 1234 \\\n'
+        '            -a myapp -e me@gmail.com -p 1234 \\\n'
         '            fetch\n'
         '\n'
 
