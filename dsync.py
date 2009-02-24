@@ -724,9 +724,11 @@ def usage(msg=None):
         '  -C <count>   Number of entities to fetch per request (default: 50)\n'
         '  -v           Verbose/debug output\n'
         '\n'
+        'Commands:\n'
+        '\n'
         '  fetch\n'
-        '    Start fetching data from Datastore to local database.\n'
-        '    Automatically runs "sync" if required.\n'
+        '    Start fetching data from Datastore to local database,.\n'
+        '    synchronizing its schema if necessary.\n'
         '\n'
         '  orphaned\n'
         '    List properties and tables that no longer have associated\n'
@@ -738,13 +740,7 @@ def usage(msg=None):
         '    classes. Check "orphaned" output first to verify this\n'
         '    won\'t result in data loss!\n'
         '\n'
-        'Examples:\n'
-        '    Load Models from $HOME/src/myapp/{models,counter}.py to\n'
-        '    create/update the schema in $HOME/myapp.db:\n'
-        '\n'
-        '        %s -L $HOME/src -m myapp.models -m myapp.counters\n'
-        '            -d $HOME/myapp.db sync\n'
-        '\n'
+        'Example:\n'
         '    Backup "myapp.appspot.com"\'s datastore to $HOME/myapp.db\n'
         '    except for RemoteUrlCacheEntry:\n'
         '\n'
@@ -839,7 +835,7 @@ def main():
         return 1
     command = args[0]
 
-    if command not in ('sync', 'fetch', 'orphaned', 'prune'):
+    if command not in ('fetch', 'orphaned', 'prune'):
         usage('unrecognized command %r specified.' % (command,))
         return 1
 
