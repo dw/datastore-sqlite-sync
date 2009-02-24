@@ -115,6 +115,10 @@ def get_models(lib_paths, module_names):
     google.appengine.ext.db.Model. Before attempting imports, temporarily
     prepend the given extra library paths to sys.path.
 
+    Filters out Model subclasses whose properties() returns an empty
+    dictionary, in order to avoid helper subclasses used for adding
+    functionality, but not directly used for managing entities.
+
     @param[in]  lib_paths       List of string filesystem paths.
     @param[in]  module_names    List of module names, possibly including
                                 package prefix, e.g. "foo" or "foo.bar".
@@ -129,7 +133,8 @@ def get_models(lib_paths, module_names):
             module = __import__(name, None, None, ['.'])
             for obj in vars(module).itervalues():
                 if inspect.isclass(obj) and issubclass(obj, db.Model):
-                    models.add(obj)
+                    if obj.properties():
+                        models.add(obj)
     finally:
         sys.path = old_sys_path
 
@@ -195,38 +200,48 @@ def translate_type(typ):
 
     raise TypeError('don\'t know how to translate type %r to SQL.' % (typ,))
 
-# ( 'DestSqlType' -> ( ( issubclass, translator ) ) )
-# When modifying, be very aware of inheritance hierarchy and effects it has on
-# the order of below.
-translate_type.map = (
-    ( 'TEXT',
-        ( datastore_types.Key,        lambda v: str(v)                   ),
-        # Map 8 bit data using a codepage that defines every value.
-        ( datastore_types.ByteString, lambda v: v.decode('iso8859-1')    ),
-        ( datastore_types.IM,         lambda v: unicode(v)               ),
-        ( users.User,                 lambda v: v.email()                ),
-        ( datastore_types.GeoPt,      lambda v: '%s:%s' % (v.lat, v.lon) ),
-        ( str,                        lambda v: v.decode('iso8859-1')    ),
-        ( unicode,                    lambda v: v                        ),
-    ),
-    ( 'DATETIME',
-        ( datetime,                   lambda v: v.strftime(
-                                                   '%Y-%m-%d %H:%M:%S')  ),
-        ( time,                       lambda v: v.strftime(
-                                                   '01-01-1970 %H:%M:%S')),
-        ( date,                       lambda v: v.strftime(
-                                                   '%Y-%m-%d %H:%M:%S')  ),
-    ),
-    ( 'INTEGER',
-        # int catches bool too.
-        ( int,                        lambda v: long(v)                  ),
-        # catching Rating too.
-        ( long,                       lambda v: long(v)                  ),
-    ),
-    ( 'REAL',
-        ( float,                      lambda v: v                        ),
+
+def build_translate_type_map():
+    '''
+    Build the mappings of Datastore types to SQL types and translator
+    functions. This is done inside a function because the AppEngine SDK is not
+    statically imported.
+    '''
+
+    global translate_type
+
+    # ( 'DestSqlType' -> ( ( issubclass, translator ) ) )
+    # When modifying, be very aware of inheritance hierarchy and effects it has
+    # on the order of below.
+    translate_type.map = (
+        ( 'TEXT', (
+            ( datastore_types.Key,        lambda v: str(v)                   ),
+            # Map 8 bit data using a codepage that defines every value.
+            ( datastore_types.ByteString, lambda v: v.decode('iso8859-1')    ),
+            ( datastore_types.IM,         lambda v: unicode(v)               ),
+            ( users.User,                 lambda v: v.email()                ),
+            ( datastore_types.GeoPt,      lambda v: '%s:%s' % (v.lat, v.lon) ),
+            ( str,                        lambda v: v.decode('iso8859-1')    ),
+            ( unicode,                    lambda v: v                        ),
+        ), ),
+        ( 'DATETIME', (
+            ( datetime,                   lambda v: v.strftime(
+                                                       '%Y-%m-%d %H:%M:%S')  ),
+            ( time,                       lambda v: v.strftime(
+                                                       '01-01-1970 %H:%M:%S')),
+            ( date,                       lambda v: v.strftime(
+                                                       '%Y-%m-%d %H:%M:%S')  ),
+        ), ),
+        ( 'INTEGER', (
+            # int catches bool too.
+            ( int,                        lambda v: long(v)                  ),
+            # catching Rating too.
+            ( long,                       lambda v: long(v)                  ),
+        ), ),
+        ( 'REAL', (
+            ( float,                      lambda v: v                        ),
+        ), ),
     )
-)
 
 
 def sync_model(db, models):
@@ -236,12 +251,12 @@ def sync_model(db, models):
 
     c = db.cursor()
 
-    tables = set(c.execute('SELECT name '
-                           'FROM sqlite_master '
-                           "WHERE type = 'table'"))
-    views = set(c.execute('SELECT name '
-                          'FROM sqlite_master '
-                          "WHERE type = 'view'").fetchall())
+    tables = set(r[0] for r in c.execute('SELECT name '
+                                         'FROM sqlite_master '
+                                         "WHERE type = 'table'"))
+    views = set(r[0] for r in c.execute('SELECT name '
+                                        'FROM sqlite_master '
+                                        "WHERE type = 'view'").fetchall())
 
     # Update fact and property tables first.
     new_fact_tables = []
@@ -249,16 +264,16 @@ def sync_model(db, models):
 
     for klass in models:
         table = translate_name(klass.__name__)
-        if table not not tables:
+        if table not in tables:
            new_fact_tables.append((klass, table))
 
         for prop_name, prop in klass.properties().iteritems():
             table = translate_name(klass.__name__, prop_name)
             if table not in tables:
-                new_prop_tables_append((klass, prop_name, prop, table))
+                new_prop_tables.append((klass, prop_name, prop, table))
 
     logging.info('About to create %d fact tables and %d property tables.',
-                 len(new_fact_tables), len(new_prop_tableS))
+                 len(new_fact_tables), len(new_prop_tables))
 
     for klass, table in new_fact_tables:
         c.execute('CREATE TABLE %s(id INT NOT NULL)' % (table,))
@@ -273,7 +288,6 @@ def sync_model(db, models):
             db.rollback()
             raise SystemExit(1)
 
-        
 
 #
 # Command line interface.
@@ -419,6 +433,9 @@ def main():
     except sqlite3.OperationalError, e:
         logging.error('could not open database: %s', e)
         return 1
+
+    # Perform any common initializations here.
+    build_translate_type_map()
 
     # Local-only commands:
     if command == 'sync':
