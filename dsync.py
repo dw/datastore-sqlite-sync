@@ -127,7 +127,7 @@ def translate_type(typ):
     @raises     TypeError   Type cannot be translated to SQL.
     '''
 
-    for sql_type, rules in translate_type.model_map:
+    for sql_type, rules in translate_type.map:
         for klass, translator in rules:
             if issubclass(typ, klass):
                 return sql_type, translator
@@ -145,7 +145,7 @@ def build_translate_type_map():
     # ( 'DestSqlType' -> ( (issubclass, translator), ), )
     # When modifying, be very aware of inheritance hierarchy and effects it
     # has on the order of below.
-    translate_type.model_map = (
+    translate_type.map = (
         ( 'TEXT', (
             ( datastore_types.Key, lambda v: str(v) ),
             # model_map 8 bit data using a codepage that defines every value.
