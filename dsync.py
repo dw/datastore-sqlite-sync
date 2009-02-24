@@ -750,7 +750,7 @@ def usage(msg=None):
         '            fetch\n'
         '\n'
 
-        % (sys.argv[0], sys.argv[0], sys.argv[0])
+        % (sys.argv[0], sys.argv[0])
     )
 
     if msg:
