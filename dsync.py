@@ -175,7 +175,7 @@ def build_translate_type_map():
     )
 
 
-def get_models(lib_paths, module_names):
+def get_models(lib_paths, module_names, exclude):
     '''
     Load a set of Python modules and search them for subclasses of
     google.appengine.ext.db.Model. Before attempting imports, temporarily
@@ -188,6 +188,7 @@ def get_models(lib_paths, module_names):
     @param[in]  lib_paths       List of string filesystem paths.
     @param[in]  module_names    List of module names, possibly including
                                 package prefix, e.g. "foo" or "foo.bar".
+    @param[in]  exclude         List of string model subclass names to exclude.
     '''
 
     models = set()
@@ -199,8 +200,18 @@ def get_models(lib_paths, module_names):
             module = __import__(name, None, None, ['.'])
             for obj in vars(module).itervalues():
                 if inspect.isclass(obj) and issubclass(obj, db.Model):
-                    if obj.properties():
-                        models.add(obj)
+                    klass_name = obj.__name__
+                    if not obj.properties():
+                        logging.debug('ignoring %s from module %s: no properties.',
+                                      klass_name, name)
+                        continue
+
+                    if klass_name in exclude:
+                        logging.debug('ignoring %s from module %s: excluded.',
+                                      klass_name, name)
+                        continue
+
+                    models.add(obj)
     finally:
         sys.path = old_sys_path
 
@@ -251,6 +262,7 @@ def get_model_map(models):
     '''
 
     map = {}
+
     for klass in models:
         table_name = translate_name(klass.__name__)
         props = {}
@@ -273,23 +285,42 @@ def get_model_map(models):
             props[prop_name] = prop, prop_table_name, sql_type, translator
 
         map[klass.__name__] = klass, table_name, props
+
     return map
 
 
-def sync_model(sql, models):
+def get_tables_views(sql):
     '''
-    Given a list of 
+    Return a tuple of sets describing the tables and views in an SQLite
+    database.
+
+    @param[in]  sql     DBAPI connection object.
+    @returns            (set-of-string-table-names, set-of-string-view-names)
     '''
 
-    map = get_model_map(models)
     c = sql.cursor()
-
     tables = set(r[0] for r in c.execute('SELECT name '
                                          'FROM sqlite_master '
                                          "WHERE type = 'table'"))
+
     views = set(r[0] for r in c.execute('SELECT name '
                                         'FROM sqlite_master '
-                                        "WHERE type = 'view'").fetchall())
+                                        "WHERE type = 'view'"))
+
+    return tables, views
+
+
+def sync_model(sql, map):
+    '''
+    Given a database connection and mapping of Model subclasses to SQL types,
+    add any missing tables and views to the database schema.
+
+    @param[in]  sql     DBAPI connection object.
+    @param[in]  map     Model mapping created by get_model_map().
+    '''
+
+    tables, tables = get_tables_views(sql)
+    c = sql.cursor()
 
     # Update fact and property tables first.
     for klass_name, (klass, table_name, props) in map.iteritems():
@@ -333,6 +364,42 @@ def sync_model(sql, models):
         logging.info('created view %s_view', table_name)
 
 
+def print_orphaned(sql, map):
+    '''
+    Output a list of tables that have no corresponding Model subclasses or
+    properties in the given map.
+
+    @param[in]  sql     DBAPI connection objet.
+    @param[in]  map     Model mapping created by get_model_map().
+    '''
+
+    tables, views = get_tables_views(sql)
+
+    active_tables = set()
+    active_views = set()
+
+    for _, (_, table_name, props) in map.iteritems():
+        active_tables.add(table_name)
+        active_views.add(table_name + '_view')
+        for _, table_name, _, _ in props.itervalues():
+            active_tables.add(table_name)
+
+    orphaned_tables = tables.difference(active_tables)
+    if orphaned_tables:
+        logging.info('orphaned tables:')
+        for table_name in orphaned_tables:
+            logging.info('  %s', table_name)
+
+    orphaned_views = views.difference(active_views)
+    if orphaned_views:
+        logging.info('orphaned views:')
+        for view_name in orphaned_views:
+            logging.info('  %s', view_name)
+
+    if not (orphaned_tables or orphaned_views):
+        logging.info('no orphans.')
+
+
 #
 # Command line interface.
 #
@@ -350,6 +417,7 @@ def usage(msg=None):
         '  -m <name>    Load Model classes from module\n'
         '  -d <path>    Local database path (default "./models.sqlite3")\n'
         '  -x <name>    Exclude the given Module class\n'
+        '  -v           Verbose/debug output\n'
         '\n'
         'Commands:\n'
         '  sync\n'
@@ -405,8 +473,6 @@ def main():
         usage('could not locate AppEngine SDK modules. Traceback below.')
         traceback.print_last()
 
-    logging.basicConfig(level=logging.DEBUG)
-
     app_name = None
     email = None
     password = None
@@ -415,9 +481,10 @@ def main():
     model_modules = []
     sql_path = './models.sqlite3'
     exclude_models = []
+    level = logging.INFO
 
     try:
-        optlist = 'a:e:p:r:L:m:d:x:'
+        optlist = 'a:e:p:r:L:m:d:x:v'
         opts, args = getopt.gnu_getopt(sys.argv[1:], optlist)
     except getopt.GetoptError, e:
         usage(str(e))
@@ -440,8 +507,12 @@ def main():
             sql_path = optarg
         elif opt == '-x':
             exclude_models.append(optarg)
+        elif opt == '-v':
+            level = logging.DEBUG
         else:
             assert False
+
+    logging.basicConfig(level=level)
 
     if len(args) > 1:
         usage('too many arguments: please specify a single command.')
@@ -459,7 +530,7 @@ def main():
         usage('no model modules specified, at least one required.')
         return 1
 
-    models = get_models(lib_paths, model_modules)
+    models = get_models(lib_paths, model_modules, exclude_models)
     if not models:
         logging.error('no google.appengine.ext.db.Model subclasses found '
                       'in %s', model_modules)
@@ -473,6 +544,10 @@ def main():
             return 1
         init_sdk_env(app_name, email, password, remote_path)
 
+    # Perform any common initializations here.
+    build_translate_type_map()
+    map = get_model_map(models)
+
     # Initialize the database connection.
     try:
         sql = sqlite3.connect(sql_path)
@@ -480,18 +555,15 @@ def main():
         logging.error('could not open database: %s', e)
         return 1
 
-    # Perform any common initializations here.
-    build_translate_type_map()
-
     # Local-only commands:
     if command == 'sync':
-        sync_model(sql, models)
+        sync_model(sql, map)
     elif command == 'orphaned':
-        print_orphaned(sql, models)
+        print_orphaned(sql, map)
     elif command == 'prune':
-        prune_orphaned(sql, models)
+        prune_orphaned(sql, map)
     elif command == 'fetch':
-        fetch(sql, models)
+        fetch(sql, map)
     else:
         assert False
 
