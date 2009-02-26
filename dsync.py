@@ -159,6 +159,52 @@ def prompt_account_info(email, password):
 
 
 #
+# SQLite 3 support.
+#
+
+class LoggingSqliteCursor(sqlite3.Cursor):
+    '''
+    Simple wrapper around sqlite3.Cursor that causes failed SQL statements to
+    be logged using the logging package.
+    '''
+
+    def execute(self, fmt, args=None):
+        try:
+            if args:
+                return sqlite3.Cursor.execute(self, fmt, args)
+            else:
+                return sqlite3.Cursor.execute(self, fmt)
+        except:
+            logging.error('failed sql was: %s %s', fmt, args)
+            raise
+
+
+class LoggingSqliteConnection(sqlite3.Connection):
+    '''
+    sqlite3.Connection subclass that uses LoggingCursor.
+    '''
+
+    def cursor(self):
+        return sqlite3.Connection.cursor(self, LoggingSqliteCursor)
+
+
+def create_sqlite_factory(sql_path):
+    '''
+    Create a factory for producing DBAPI connection objects.
+
+    @param[in]  sql_path    String database filesystem path.
+    @returns                LoggingSqliteConnection instance.
+    '''
+
+    def sql_factory():
+        return sqlite3.connect(sql_path, isolation_level=None,
+                               factory=LoggingConnection,
+                               detect_types=sqlite3.PARSE_DECLTYPES)
+
+    return sql_factory
+
+
+#
 # Program implementation.
 #
 
@@ -1013,30 +1059,9 @@ def main():
 
         init_sdk_env(app_name, auth_cb, remote_path)
 
-    # SQLite3 requires one connection per thread, I require logging.
-    def sql_factory():
-        class LoggingCursor(sqlite3.Cursor):
-            def execute(self, fmt, args=None):
-                try:
-                    if args:
-                        return sqlite3.Cursor.execute(self, fmt, args)
-                    else:
-                        return sqlite3.Cursor.execute(self, fmt)
-                except:
-                    logging.error('failed sql was: %s %s', fmt, args)
-                    raise
-
-        class LoggingConnection(sqlite3.Connection):
-            def cursor(self):
-                return sqlite3.Connection.cursor(self, LoggingCursor)
-
-        return sqlite3.connect(sql_path, isolation_level=None,
-                               factory=LoggingConnection,
-                               detect_types=sqlite3.PARSE_DECLTYPES)
-
-
     # Initialize the database connection.
     try:
+        sql_factory = create_sqlite_factory(sql_path)
         sql = sql_factory()
     except sqlite3.OperationalError, e:
         logging.error('could not open database: %s', e)
