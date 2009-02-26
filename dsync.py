@@ -43,6 +43,7 @@ import sys
 import threading
 import traceback
 import urllib2
+import warnings
 
 from datetime import date, datetime, time
 
@@ -72,22 +73,29 @@ def find_sdk():
     @returns        String or None.
     '''
 
-    for path in [ '/usr/local/google_appengine' ]:
+    for path in [ '/usr/local/google_appengine',
+                  r'C:\Program Files\Google\google_appengine' ]:
         if os.path.exists(path):
-            return path
+            break
+
+    if not path:
+        for path in os.environ['PATH'].split(os.path.pathsep):
+            probe = os.path.join(path, 'dev_appserver.py')
+            if os.path.exists(probe):
+                break
+
+    logging.debug('detected SDK path: %s', path)
+    return path
 
 
-def load_appengine_modules():
+def load_appengine_modules(sdk_path):
     '''
     Search for the AppEngine SDK, adding its module paths to sys.path, and
     importing some important modules.
 
+    @param[in]  sdk_path        String install directory of AppEngine SDK.
     @throws     ImportError     SDK not found, or module cannot be loaded.
     '''
-
-    sdk_path = find_sdk()
-    if not sdk_path:
-        raise ImportError('cannot locate AppEngine SDK.')
 
     yaml_path = os.path.join(sdk_path, 'lib', 'yaml', 'lib')
     sys.path.insert(0, yaml_path)
@@ -828,6 +836,11 @@ def usage(msg=None):
         '  --batch      Fail rather than prompt for a password if none is\n'
         '               provided on the command line.\n'
         '\n'
+        '  --sdk-path=<path>\n'
+        '               Path to AppEngine SDK installation directory.\n'
+        '\n'
+        '  --help       This message.\n'
+        '\n'
         'Commands:\n'
         '\n'
         '  sync-model\n'
@@ -863,6 +876,7 @@ def usage(msg=None):
 
     if msg:
         sys.stderr.write('Error: %s\n' % (msg,))
+    raise SystemExit(msg and 1 or 0)
 
 
 def die(msg, *args):
@@ -876,7 +890,7 @@ def die(msg, *args):
     if args:
         msg %= args
 
-    sys.stderr.write('%s: error: %s\n', sys.argv[0], msg)
+    sys.stderr.write('%s: error: %s\n' % (sys.argv[0], msg))
     raise SystemExit(1)
 
 
@@ -885,11 +899,10 @@ def main():
     CLI implementation.
     '''
 
-    try:
-        load_appengine_modules()
-    except ImportError:
-        usage('could not locate AppEngine SDK modules. Traceback below.')
-        traceback.print_last()
+    # If we're running on Python 2.6+, turn off warnings until a version of the
+    # SDK is released that doesn't trigger them.
+    if sys.version_info > (2.5):
+        warnings.filterwarnings('ignore')
 
     app_name = None
     email = None
@@ -903,10 +916,11 @@ def main():
     worker_count = 5
     batch_size = 50
     batch = False
+    sdk_path = None
 
     try:
         optlist = 'a:e:p:r:L:m:d:x:vN:C:'
-        longoptlist = [ 'batch' ]
+        longoptlist = [ 'batch', 'sdk-path=', 'help' ]
         opts, args = getopt.gnu_getopt(sys.argv[1:], optlist, longoptlist)
     except getopt.GetoptError, e:
         usage(str(e))
@@ -947,10 +961,25 @@ def main():
                 die('bad -C: ', e)
         elif opt == '--batch':
             batch = True
+        elif opt == '--sdk-path':
+            sdk_path = optarg
+        elif opt == '--help':
+            usage()
         else:
             assert False
 
     logging.basicConfig(level=level)
+
+    sdk_path = sdk_path or find_sdk()
+    if not sdk_path:
+        die('Cannot find SDK in default places or PATH, specify --sdk-path.')
+
+    try:
+        load_appengine_modules(sdk_path)
+    except ImportError:
+        traceback.print_exc()
+        print
+        die('could not locate AppEngine SDK modules, use --sdk-path option.')
 
     if len(args) > 1:
         die('too many arguments: please specify a single command.')
