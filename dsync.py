@@ -54,14 +54,6 @@ except ImportError:
 
 
 #
-# Exceptions.
-#
-
-class Failure(Exception):
-    'General program failure. Covers everything for now.'
-
-
-#
 # AppEngine SDK related.
 #
 
@@ -146,7 +138,6 @@ def prompt_account_info(email, password):
     @param[in]  email       String e-mail from command line or None.
     @param[in]  password    String password from command line or None.
     @returns                (e-mail, password)
-    @raises     Failure     Could not fetch username or password.
     '''
 
     while not email:
@@ -198,7 +189,7 @@ def create_sqlite_factory(sql_path):
 
     def sql_factory():
         return sqlite3.connect(sql_path, isolation_level=None,
-                               factory=LoggingConnection,
+                               factory=LoggingSqliteConnection,
                                detect_types=sqlite3.PARSE_DECLTYPES)
 
     return sql_factory
@@ -382,12 +373,15 @@ def get_model_map(models):
     infos = []
 
     for klass in models:
+        base_name = translate_name(klass.__name__)
+
         info = ModelInfo(klass=klass, name=klass.__name__,
-                         table=translate_name(klass.__name__), props=[],
+                         table=base_name + '_entity',
+                         view=base_name, props=[],
                          now_prop=None)
 
         for prop in klass.properties().itervalues():
-            prop_table_name = translate_name(info.table, prop.name)
+            prop_table_name = translate_name(base_name, prop.name)
             # TODO(dmw): seems like a bug in the SDK. data_type should be
             # Key, not Model.
             if isinstance(prop, db.ReferenceProperty):
@@ -514,7 +508,6 @@ def sync_model(sql, infos):
     # don't yet exit. Drop any old one first in case columns have been added
     # or removed.
     for info in infos:
-        view_name = '%s_view' % (info.table,)
         fields = []
         joins = [ info.table ]
         columns = set()
@@ -527,17 +520,17 @@ def sync_model(sql, infos):
                           info.table, info.table))
             columns.add((translate_name(prop_info.name), prop_info.sql_type))
 
-        if view_name in dbinfo.views:
-            if columns == get_sqlite_columns(sql, view_name):
+        if info.view in dbinfo.views:
+            if columns == get_sqlite_columns(sql, info.view):
                 continue
-            c.execute('DROP VIEW %s_view' % (info.table,))
-            logging.debug('dropped out of date view %s', view_name)
+            c.execute('DROP VIEW %s' % (info.view,))
+            logging.debug('dropped out of date view %s', info.view)
 
-        c.execute('CREATE VIEW %s_view AS SELECT %s FROM %s' %
-                  (info.table,
+        c.execute('CREATE VIEW %s AS SELECT %s FROM %s' %
+                  (info.view,
                    ', '.join(fields),
                    ' LEFT JOIN '.join(joins)))
-        logging.debug('created view %s_view', info.table)
+        logging.debug('created view %s', info.view)
 
 
 def get_orphaned(sql, infos):
@@ -557,7 +550,7 @@ def get_orphaned(sql, infos):
 
     for info in infos:
         active_tables.add(info.table)
-        active_views.add(info.table + '_view')
+        active_views.add(info.view)
         for prop_info in info.props:
             active_tables.add(prop_info.table)
 
