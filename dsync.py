@@ -34,6 +34,7 @@ unchanged.
 from __future__ import with_statement
 
 import getopt
+import getpass
 import inspect
 import logging
 import os
@@ -41,6 +42,7 @@ import sqlite3
 import sys
 import threading
 import traceback
+import urllib2
 
 from datetime import date, datetime, time
 
@@ -48,6 +50,14 @@ try:
     from cStringIO import StringIO
 except ImportError:
     from StringIO import StringIO
+
+
+#
+# Exceptions.
+#
+
+class Failure(Exception):
+    'General program failure. Covers everything for now.'
 
 
 #
@@ -96,26 +106,48 @@ def load_appengine_modules():
     from google.appengine.ext.remote_api import remote_api_stub
 
 
-def init_sdk_env(app_name, email, password, remote_path='/remote_api'):
+def init_sdk_env(app_name, auth_cb, remote_path='/remote_api'):
     '''
     Initialize various environment variables used by the SDK, and log into
     the application.
 
     @param[in]  app_name    application name, e.g. "shell".
-    @param[in]  email       Developer's e-mail address.
-    @param[in]  password    Password.
+    @param[in]  auth_cb     Callback returning ('email', 'password').
     @param[in]  remote_path Path to remote_api handler on server.
     '''
 
     os.environ['AUTH_DOMAIN'] = 'gmail.com'
-    os.environ['USER_EMAIL'] = email
-    remote_api_stub.ConfigureRemoteDatastore(app_name, remote_path,
-                                             lambda: (email, password))
+    #os.environ['USER_EMAIL'] = email
+    remote_api_stub.ConfigureRemoteDatastore(app_name, remote_path, auth_cb)
 
     # TODO(dmw): ensure remote_api is thread-safe.
     # 'ping' /remote_api before firing up a bunch of threads, which seems to
     # result in logging in multiple times.
-    datastore.Get([db.Key.from_path('NonExistent', 1337)])
+    try:
+        datastore.Get([db.Key.from_path('NonExistent', 1337)])
+    except (urllib2.HTTPError, urllib2.URLError, KeyboardInterrupt), e:
+        logging.error('remote_api connection failed: %s', e)
+        raise SystemExit(1)
+
+
+def prompt_account_info(email, password):
+    '''
+    Interatively with the user to get authentication information not provided
+    on the command line.
+
+    @param[in]  email       String e-mail from command line or None.
+    @param[in]  password    String password from command line or None.
+    @returns                (e-mail, password)
+    @raises     Failure     Could not fetch username or password.
+    '''
+
+    while not email:
+        email = raw_input('E-mail address: ')
+
+    while not password:
+        password = getpass.getpass('Password: ')
+
+    return email, password
 
 
 #
@@ -125,11 +157,20 @@ def init_sdk_env(app_name, email, password, remote_path='/remote_api'):
 class Bag(dict):
     __getattr__ = dict.__getitem__
 
+class DatabaseInfo(Bag):
+    '''
+    Database object information. Expected to contain 3 attributes:
+
+        tables: set of string table names.
+        views: set of string view names.
+        indexes: set of string index names.
+    '''
+
 class ModelInfo(Bag):
-    'SQL mapping information for a google.appengine.ext.db.Model subclass.'
+    'SQL mapping for a google.appengine.ext.db.Model subclass.'
 
 class PropertyInfo(Bag):
-    'SQL mapping information for a google.appengine.ext.db.Property instance.'
+    'SQL mapping for a google.appengine.ext.db.Property instance.'
 
 
 def translate_type(typ):
@@ -161,8 +202,8 @@ def translate_type(typ):
 def build_translate_type_map():
     '''
     Build the mappings of Datastore types to SQL types and translator
-    functions. This is done inside a function because the AppEngine SDK is not
-    statically imported.
+    functions. This is done in a function because the AppEngine SDK is
+    imported at runtime.
     '''
 
     # ( 'DestSqlType' -> ( (issubclass, translator), ), )
@@ -181,16 +222,16 @@ def build_translate_type_map():
             ( basestring, lambda v: unicode(v) ),
         ), ),
         ( 'TIMESTAMP', (
-            ( datetime, lambda v: v and v.strftime('%Y-%m-%d %H:%M:%S') or None ),
+            ( datetime, lambda v: v.strftime('%Y-%m-%d %H:%M:%S') ),
             # TODO(dmw): what to do with these?
-            ( time, lambda v: v and v.strftime('01-01-1970 %H:%M:%S') or None ),
-            ( date, lambda v: v and v.strftime('%Y-%m-%d %H:%M:%S') or None ),
+            ( time, lambda v: v.strftime('01-01-1970 %H:%M:%S') ),
+            ( date, lambda v: v.strftime('%Y-%m-%d %H:%M:%S') ),
         ), ),
         ( 'INTEGER', (
             # int catches bool too.
-            ( int, lambda v: v and long(v) or None ),
+            ( int, lambda v: long(v) ),
             # catching Rating too.
-            ( long, lambda v: v and long(v) or None ),
+            ( long, lambda v: long(v) ),
         ), ),
         ( 'REAL', (
             ( float, lambda v: v ),
@@ -322,25 +363,51 @@ def get_model_map(models):
     return infos
 
 
-def get_tables_views(sql):
+def get_sqlite_info(sql):
     '''
-    Return a tuple of sets describing the tables and views in an SQLite
-    database.
+    Return an object describing the tables, views, and indexes of an SQLite
+    database. Returned object contains 3 attributes:
 
     @param[in]  sql     DBAPI connection object.
-    @returns            (set-of-string-table-names, set-of-string-view-names)
+    @returns            DatabaseInfo instance.
     '''
 
     c = sql.cursor()
-    tables = set(r[0] for r in c.execute('SELECT name '
-                                         'FROM sqlite_master '
-                                         "WHERE type = 'table'"))
+    c.execute('SELECT type, name FROM sqlite_master '
+              'WHERE type in (?, ?, ?)', ('table', 'view', 'index'))
 
-    views = set(r[0] for r in c.execute('SELECT name '
-                                        'FROM sqlite_master '
-                                        "WHERE type = 'view'"))
+    tables = set()
+    views = set()
+    indexes = set()
 
-    return tables, views
+    for typ, name in c:
+        if typ == 'table':
+            tables.add(name)
+        elif typ == 'view':
+            views.add(name)
+        elif typ == 'index':
+            indexes.add(name)
+        else:
+            assert False
+
+    return DatabaseInfo(tables=tables,
+                        views=views,
+                        indexes=indexes)
+
+
+def get_sqlite_columns(sql, name):
+    '''
+    Return a set of tuples describing the column names and their types for a
+    given database object (either a TABLE or VIEW).
+
+    @param[in]  sql     DBAPI connection object.
+    @param[in]  name    String TABLE or VIEW name.
+    @returns            Set of (string column name, string column type).
+    '''
+
+    c = sql.cursor()
+    c.execute('PRAGMA TABLE_INFO(%s)' % (name,))
+    return set((name, typ) for (_, name, typ, _, _, _) in c)
 
 
 def sync_model(sql, infos):
@@ -352,47 +419,65 @@ def sync_model(sql, infos):
     @param[in]  infos   Output of get_model_map().
     '''
 
-    tables, views = get_tables_views(sql)
+    dbinfo = get_sqlite_info(sql)
     c = sql.cursor()
 
     for info in infos:
         # Update fact and property tables first.
-        if info.table not in tables:
+        if info.table not in dbinfo.tables:
             c.execute('CREATE TABLE %s ('
                         'id INTEGER PRIMARY KEY,'
                         'ds_key TEXT NOT NULL)'
                         % (info.table,))
             logging.debug('created %s for Model %s', info.table, info.name)
 
-        for prop_info in info.props:
-            if prop_info.table in tables:
-                continue
+        index_name = '%s_ds_key_index' % (info.table,)
+        if index_name not in dbinfo.indexes:
+            c.execute('CREATE UNIQUE INDEX %s on %s(ds_key)'
+                      % (index_name, info.table))
+            logging.debug('created %s for Model %s', index_name, info.name)
 
-            c.execute('CREATE TABLE %s ('
-                        '%s_id INTEGER NOT NULL UNIQUE,'
-                        'value %s'
-                      ')' % (prop_info.table, info.table,
-                             prop_info.sql_type))
-            logging.debug('created %s for %s.%s', prop_info.table,
-                                                  info.name, prop_info.name)
+        for prop_info in info.props:
+            if prop_info.table not in dbinfo.tables:
+                c.execute('CREATE TABLE %s ('
+                            '%s_id INTEGER NOT NULL UNIQUE,'
+                            'value %s'
+                          ')' % (prop_info.table, info.table,
+                                 prop_info.sql_type))
+                logging.debug('created %s for %s.%s', prop_info.table,
+                                                      info.name,
+                                                      prop_info.name)
+
+            index_name = '%s_%s_id_index' % (prop_info.table, info.table)
+            if index_name not in dbinfo.indexes:
+                c.execute('CREATE UNIQUE INDEX %s on %s(%s_id)'
+                          % (index_name, prop_info.table, info.table))
+                logging.debug('created %s for %s.%s', index_name,
+                                                      info.name,
+                                                      prop_info.name)
 
     # Update VIEW definitions after, in order to avoid referencing tables that
-    # don't yet exit. Drop any old one first in case columns have been added or
-    # removed.
+    # don't yet exit. Drop any old one first in case columns have been added
+    # or removed.
     for info in infos:
-        if info.table + '_view' in views:
-            c.execute('DROP VIEW %s_view' % (info.table,))
-            logging.debug('dropped existing view %s_view', info.table)
-
+        view_name = '%s_view' % (info.table,)
         fields = []
         joins = [ info.table ]
+        columns = set()
 
         for prop_info in info.props:
-            fields.append('%s.value AS %s' %
+            fields.append('%s.value AS "%s"' %
                           (prop_info.table, translate_name(prop_info.name)))
             joins.append('%s ON(%s.%s_id = %s.id)' %
                          (prop_info.table, prop_info.table,
                           info.table, info.table))
+            columns.add((translate_name(prop_info.name), prop_info.sql_type))
+
+        if view_name in dbinfo.views:
+            if columns == get_sqlite_columns(sql, view_name):
+                continue
+            c.execute('DROP VIEW %s_view' % (info.table,))
+            logging.debug('dropped out of date view %s', view_name)
 
         c.execute('CREATE VIEW %s_view AS SELECT %s FROM %s' %
                   (info.table,
@@ -411,7 +496,7 @@ def get_orphaned(sql, infos):
     @returns                (orphaned-tables, orphaned-views)
     '''
 
-    tables, views = get_tables_views(sql)
+    dbinfo = get_sqlite_info(sql)
 
     active_tables = set()
     active_views = set()
@@ -422,8 +507,9 @@ def get_orphaned(sql, infos):
         for prop_info in info.props:
             active_tables.add(prop_info.table)
 
-    return tables.difference(active_tables), \
-           views.difference(active_views)
+    return DatabaseInfo(tables=dbinfo.tables.difference(active_tables),
+                        views=dbinfo.views.difference(active_views),
+                        indexes=set())
 
 
 def print_orphaned(sql, infos):
@@ -435,20 +521,20 @@ def print_orphaned(sql, infos):
     @param[in]  infos   Output of get_model_map().
     '''
 
-    tables, views = get_orphaned(sql, infos)
+    dbinfo = get_orphaned(sql, infos)
 
-    if not (tables or views):
+    if not (dbinfo.tables or dbinfo.views or dbinfo.indexes):
         logging.info('no orphans.')
         return
 
-    if tables:
+    if dbinfo.tables:
         logging.info('orphaned tables:')
-        for table_name in tables:
+        for table_name in dbinfo.tables:
             logging.info('  %s', table_name)
 
-    if views:
+    if dbinfo.views:
         logging.info('orphaned views:')
-        for view_name in views:
+        for view_name in dbinfo.views:
             logging.info('  %s', view_name)
 
 
@@ -461,14 +547,19 @@ def prune_orphaned(sql, infos):
     @param[in]  infos   Output of get_model_map().
     '''
 
-    tables, views = get_orphaned(sql, infos)
+    sync_model(sql, infos)
+    dbinfo = get_orphaned(sql, infos)
     c = sql.cursor()
 
-    for table_name in tables:
+    for index_name in dbinfo.indexes:
+        c.execute('DROP INDEX ' + index_name)
+        logging.info('Dropped %s', index_name)
+
+    for table_name in dbinfo.tables:
         c.execute('DROP TABLE ' + table_name)
         logging.info('Dropped %s', table_name)
 
-    for view_name in views:
+    for view_name in dbinfo.views:
         c.execute('DROP VIEW ' + view_name)
         logging.info('Dropped %s', view_name)
 
@@ -531,12 +622,13 @@ def save_entity(sql, info, entity):
 
     @param[in]  info        Associated ModelInfo instance.
     @param[in]  entity      appengine.ext.db.Model instance.
+    @returns                True for update, False for add.
     '''
 
     c = sql.cursor()
     key = entity.key()
     old_id = fetch_one_col(c, 'SELECT id FROM %s WHERE ds_key = ?'
-                               % (info.table, ), str(key))
+                               % (info.table,), str(key))
 
     if old_id is not None:
         c.execute('DELETE FROM %s WHERE id = ?' % (info.table,), (old_id,))
@@ -550,8 +642,16 @@ def save_entity(sql, info, entity):
     for prop in info.props:
         if old_id is not None:
             c.execute('DELETE FROM %s WHERE %s_id = ?'
-                      % (prop.table, info.table), (old_id, ))
-        value = prop.translator(prop.prop.get_value_for_datastore(entity))
+                      % (prop.table, info.table), (old_id,))
+
+        ds_value = prop.prop.get_value_for_datastore(entity)
+        if ds_value is None:
+            continue
+
+        # TODO(dmw): I don't know if this is correct. We don't insert anything
+        # if the Model instance's value is None. The resulting view join will
+        # return NULL.
+        value = prop.translator(ds_value)
         c.execute('INSERT INTO %s(%s_id, value) VALUES(?, ?)'
                   % (prop.table, info.table), (new_id, value))
 
@@ -564,6 +664,7 @@ def save_entities(sql, info, entities):
     possibly after deleting existing rows from the database with that share the
     same key. Also update info.highest to include the highest seen key or date.
 
+    @param[in]  sql         DBAPI connection object.
     @param[in]  info        Associated ModelInfo instance.
     @param[in]  entities    List of Model instances.
     '''
@@ -713,8 +814,8 @@ def usage(msg=None):
         'Options:\n'
         '\n'
         '  -a <name>    AppEngine application name, e.g. "shell"\n'
-        '  -e <addr>    Developer\'s e-mail address\n'
-        '  -p <pw>      Developer\'s password\n'
+        '  -e <addr>    Developer\'s e-mail address (default: prompt)\n'
+        '  -p <pw>      Developer\'s password (default: prompt)\n'
         '  -r <path>    remote_api path on server (default "/remote_api")\n'
         '  -L <path>    Prepend extra path to module search path\n'
         '  -m <name>    Load Model classes from module\n'
@@ -724,10 +825,17 @@ def usage(msg=None):
         '  -C <count>   Number of entities to fetch per request (default: 50)\n'
         '  -v           Verbose/debug output\n'
         '\n'
+        '  --batch      Fail rather than prompt for a password if none is\n'
+        '               provided on the command line.\n'
+        '\n'
         'Commands:\n'
         '\n'
+        '  sync-model\n'
+        '    Synchronize the database schema to match the loaded Model\n'
+        '    subclasses.\n'
+        '\n'
         '  fetch\n'
-        '    Start fetching data from Datastore to local database,.\n'
+        '    Start fetching data from Datastore to the database,\n'
         '    synchronizing its schema if necessary.\n'
         '\n'
         '  orphaned\n'
@@ -757,6 +865,21 @@ def usage(msg=None):
         sys.stderr.write('Error: %s\n' % (msg,))
 
 
+def die(msg, *args):
+    '''
+    Exit fatally, printing a message to stderr.
+
+    @param[in]  msg     String literal message or format string.
+    @param[in]  args    Format string arguments.
+    '''
+
+    if args:
+        msg %= args
+
+    sys.stderr.write('%s: error: %s\n', sys.argv[0], msg)
+    raise SystemExit(1)
+
+
 def main():
     '''
     CLI implementation.
@@ -779,10 +902,12 @@ def main():
     level = logging.INFO
     worker_count = 5
     batch_size = 50
+    batch = False
 
     try:
         optlist = 'a:e:p:r:L:m:d:x:vN:C:'
-        opts, args = getopt.gnu_getopt(sys.argv[1:], optlist)
+        longoptlist = [ 'batch' ]
+        opts, args = getopt.gnu_getopt(sys.argv[1:], optlist, longoptlist)
     except getopt.GetoptError, e:
         usage(str(e))
         return 1
@@ -812,50 +937,52 @@ def main():
                 if worker_count < 1:
                     raise ValueError('must be >= 1')
             except ValueError, e:
-                usage('Bad -N: ' + str(e))
-                return 1
+                die('bad -N: %s', e)
         elif opt == '-C':
             try:
                 batch_size = int(optarg, 10)
                 if batch_size < 1:
                     raise ValueError('must be >= 1')
             except ValueError, e:
-                usage('Bad -C: ' + str(e))
-                return 1
+                die('bad -C: ', e)
+        elif opt == '--batch':
+            batch = True
         else:
             assert False
 
     logging.basicConfig(level=level)
 
     if len(args) > 1:
-        usage('too many arguments: please specify a single command.')
-        return 1
+        die('too many arguments: please specify a single command.')
     elif len(args) == 0:
-        usage('please specify a command.')
-        return 1
+        die('please specify a command (see --help).')
     command = args[0]
 
-    if command not in ('fetch', 'orphaned', 'prune'):
-        usage('unrecognized command %r specified.' % (command,))
-        return 1
+    if command not in ('sync-model', 'fetch', 'orphaned', 'prune'):
+        die('unrecognized command %r specified.', command)
 
     if not model_modules:
-        usage('no model modules specified, at least one required.')
-        return 1
+        die('no model modules specified, at least one required.')
 
     models = get_models(lib_paths, model_modules, exclude_models)
     if not models:
-        logging.error('no google.appengine.ext.db.Model subclasses found '
-                      'in %s', model_modules)
-        return 1
+        die('no google.appengine.ext.db.Model subclasses found in %s',
+            model_modules)
+
+    if batch and not (email and password):
+        die('--batch specified but no email or password (see --help)')
+        auth_cb = lambda: email, password
+    else:
+        auth_cb = lambda: prompt_account_info(email, password)
 
     # Initialize remote_api before opening database (avoids creating a junk
     # DB on disk after a failed run).
     if command == 'fetch':
-        if not (app_name and email and password and remote_path):
+        if not (app_name and remote_path):
             usage('a required parameter is missing.')
             return 1
-        init_sdk_env(app_name, email, password, remote_path)
+
+        init_sdk_env(app_name, auth_cb, remote_path)
 
     # SQLite3 requires one connection per thread, I require logging.
     def sql_factory():
@@ -897,7 +1024,9 @@ def main():
             info.highest = get_highest_key(sql, info)
 
     # Local-only commands:
-    if command == 'orphaned':
+    if command == 'sync-model':
+        sync_model(sql, infos)
+    elif command == 'orphaned':
         print_orphaned(sql, infos)
     elif command == 'prune':
         prune_orphaned(sql, infos)
