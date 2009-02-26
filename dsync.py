@@ -508,9 +508,10 @@ def sync_model(sql, infos):
     # don't yet exit. Drop any old one first in case columns have been added
     # or removed.
     for info in infos:
-        fields = []
+        fields = [ '%s.id AS "__id"' % (info.table,),
+                   '%s.ds_key AS "__ds_key"' % (info.table,) ]
         joins = [ info.table ]
-        columns = set()
+        columns = set([ ('__id', 'INTEGER'), ('__ds_key', 'TEXT') ])
 
         for prop_info in info.props:
             fields.append('%s.value AS "%s"' %
@@ -904,9 +905,9 @@ def usage(msg=None):
         '    Backup "myapp.appspot.com"\'s datastore to $HOME/myapp.db\n'
         '    except for RemoteUrlCacheEntry:\n'
         '\n'
-        '        %s -L $HOME/src -m myapp.models -m myapp.counters \\\n'
-        '            -d $HOME/myapp.db -x RemoteUrlCacheEntry \\\n'
-        '            -a myapp -e me@gmail.com -p 1234 \\\n'
+        '        %s -L $HOME/src -m myapp.models -m myapp.counters  \\\n'
+        '            -d $HOME/myapp.db -x RemoteUrlCacheEntry       \\\n'
+        '            -a myapp -e me@gmail.com -p 1234               \\\n'
         '            fetch\n'
         '\n'
 
