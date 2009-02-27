@@ -768,6 +768,7 @@ def execute_locked(cmd):
         locked = execute_locked.lock.acquire(False)
         if locked:
             break
+        time.sleep(1)
 
     if not locked:
         raise thread.error('execute_locked could not lock after 30s.')
