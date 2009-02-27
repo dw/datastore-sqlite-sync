@@ -49,7 +49,8 @@ import traceback
 import urllib2
 import warnings
 
-from datetime import date, datetime, time
+from datetime import date, datetime
+from datetime import time as time_
 
 try:
     from cStringIO import StringIO
@@ -281,7 +282,7 @@ def build_translate_type_map():
         ( 'TIMESTAMP', (
             ( datetime, lambda v: v.strftime('%Y-%m-%d %H:%M:%S') ),
             # TODO(dmw): what to do with these?
-            ( time, lambda v: v.strftime('01-01-1970 %H:%M:%S') ),
+            ( time_, lambda v: v.strftime('01-01-1970 %H:%M:%S') ),
             ( date, lambda v: v.strftime('%Y-%m-%d %H:%M:%S') ),
         ), ),
         ( 'INTEGER', (
@@ -905,6 +906,7 @@ def fetch(sql_factory, infos, worker_count, batch_size,
     stats = dict(added=0, updated=0, models=0)
 
     logging.debug('got %d tables to check.', len(to_check))
+    start_ts = time.time()
 
     def get_next(last_info, added, updated):
         with lock:
@@ -934,8 +936,9 @@ def fetch(sql_factory, infos, worker_count, batch_size,
         thread.start()
 
     end_event.wait()
-    logging.info('grand total: %s added, %s updated in %s models.',
-                 stats['added'], stats['updated'], stats['models'])
+    duration = time.time() - start_ts
+    logging.info('grand total: %2.02fs for %s added, %s updated in %s models.',
+                 duration, stats['added'], stats['updated'], stats['models'])
     logging.debug('all fetch threads done; finished.')
 
 
