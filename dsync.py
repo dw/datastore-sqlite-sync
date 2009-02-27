@@ -1095,7 +1095,7 @@ def main():
                 if batch_size < 1:
                     raise ValueError('must be >= 1')
             except ValueError, e:
-                die('bad -C: ', e)
+                die('bad -C: %s', e)
         elif opt == '--batch':
             batch = True
         elif opt == '--sdk-path':
