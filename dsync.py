@@ -627,6 +627,20 @@ def prune_orphaned(sql, infos):
     logging.info('deleted %d objects total.', sum(map(len, [tables, views])))
 
 
+def fetch_one_col(c, fmt, *args):
+    '''
+    Fetch the value of a single SQL query column.
+
+    @param[in]  c       DBAPI cursor.
+    @param[in]  fmt     SQL query format string.
+    @param[in]  args    Optional arguments.
+    @returns            Column value or None.
+    '''
+
+    for value, in c.execute(fmt, args):
+        return value
+
+
 def get_highest_date(sql, info):
     '''
     Fetch the highest recorded auto_now date from the given table. If no date
@@ -639,15 +653,10 @@ def get_highest_date(sql, info):
 
     assert info.now_prop
 
-    # TODO(dmw): make this not do a scan.
-    c = sql.cursor()
-
-    highest = datetime(1970, 1, 1)
-    for value, in c.execute('SELECT value AS value FROM %s'
-                            % (info.now_prop.table,)):
-        highest = max(highest, value)
-
-    return highest
+    # TODO(dmw): ensure this doesn't scan.
+    return fetch_one_col(sql.cursor(),
+                         'SELECT MAX(value) FROM ' + info.now_prop.table) \
+           or datetime(1970, 1, 1)
 
 
 def get_highest_key(sql, info):
@@ -669,11 +678,6 @@ def get_highest_key(sql, info):
         highest = max(highest or key, key)
 
     return highest
-
-
-def fetch_one_col(c, fmt, *args):
-    for value, in c.execute(fmt, args):
-        return value
 
 
 def save_entity(sql, info, entity):
@@ -705,16 +709,14 @@ def save_entity(sql, info, entity):
             c.execute('DELETE FROM %s WHERE %s_id = ?'
                       % (prop.table, info.table), (old_id,))
 
-        ds_value = prop.prop.get_value_for_datastore(entity)
-        if ds_value is None:
-            continue
-
         # TODO(dmw): I don't know if this is correct. We don't insert anything
         # if the Model instance's value is None. The resulting view join will
         # return NULL.
-        value = prop.translator(ds_value)
-        c.execute('INSERT INTO %s(%s_id, value) VALUES(?, ?)'
-                  % (prop.table, info.table), (new_id, value))
+        ds_value = prop.prop.get_value_for_datastore(entity)
+        if ds_value is not None:
+            c.execute('INSERT INTO %s(%s_id, value) VALUES(?, ?)'
+                      % (prop.table, info.table),
+                      (new_id, prop.translator(ds_value)))
 
     return old_id is not None
 
@@ -722,8 +724,8 @@ def save_entity(sql, info, entity):
 def save_entities(sql, info, entities):
     '''
     Save a set of Model instances retrieved from Datastore to the database,
-    possibly after deleting existing rows from the database with that share the
-    same key. Also update info.highest to include the highest seen key or date.
+    possibly after deleting existing rows from the database that share the same
+    key. Also update info.highest to include the highest seen key or date.
 
     @param[in]  sql         DBAPI connection object.
     @param[in]  info        Associated ModelInfo instance.
