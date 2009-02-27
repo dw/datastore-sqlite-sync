@@ -33,14 +33,18 @@ unchanged.
 
 from __future__ import with_statement
 
+import fnmatch
 import getopt
 import getpass
 import inspect
 import logging
 import os
 import sqlite3
+import subprocess
 import sys
+import thread
 import threading
+import time
 import traceback
 import urllib2
 import warnings
@@ -51,6 +55,14 @@ try:
     from cStringIO import StringIO
 except ImportError:
     from StringIO import StringIO
+
+
+#
+# Exceptions.
+#
+
+class Failure(Exception):
+    'Some failure.'
 
 
 #
@@ -298,6 +310,7 @@ def get_models(lib_paths, module_names, exclude):
     @param[in]  module_names    List of module names, possibly including
                                 package prefix, e.g. "foo" or "foo.bar".
     @param[in]  exclude         List of string model subclass names to exclude.
+    @returns                    Set of Model subclasses.
     '''
 
     models = set()
@@ -739,7 +752,37 @@ def save_entities(sql, info, entities):
     return added, updated
 
 
-def fetch_thread(sql_factory, get_next, batch_size):
+def execute_locked(cmd):
+    '''
+    Execute a shell command while holding a global lock. Ensures only a single
+    thread can run a command a time.
+
+    @param[in]  cmd             String passed to subprocess.Popen().
+    @raises     thread.error    Lock could not be acquired after 30 seconds.
+    @raises     Failure         Subprocess returned nonzero return code.
+    '''
+
+    for i in range(30):
+        locked = execute_locked.lock.acquire(False)
+        if locked:
+            break
+
+    if not locked:
+        raise thread.error('execute_locked could not lock after 30s.')
+
+    try:
+        proc = subprocess.Popen(args=cmd, shell=True)
+        rc = proc.wait()
+        if rc:
+            raise Failure('command return code was ' + str(rc))
+    finally:
+        execute_locked.lock.release()
+
+execute_locked.lock = threading.Lock()
+
+
+def fetch_thread(sql_factory, get_next, batch_size,
+                 trigger_commands, trigger_statements):
     '''
     Fetch worker thread. Calls get_next() to get the next Model subclass
     requiring replication, then repeatedly fetches small batches until no more
@@ -747,9 +790,15 @@ def fetch_thread(sql_factory, get_next, batch_size):
 
     Thread exits when get_next() returns None.
 
-    @param[in]  sql_factory     DBAPI connection factory.
-    @param[in]  get_next        Callback to invoke to get next table.
-    @param[in]  batch_size      Number entities to fetch per request.
+    @param[in]  sql_factory         DBAPI connection factory.
+    @param[in]  get_next            Callback to invoke to get next table.
+    @param[in]  batch_size          Number entities to fetch per request.
+    @param[in]  trigger_commands    List of ('ModelClass', 'command') shell
+                                    commands execute when ModelClass updates 
+                                    occur.
+    @param[in]  trigger_statements  List of ('ModelClass', 'command') SQL
+                                    statements execute when ModelClass updates
+                                    occur.
     '''
 
     sql = sql_factory()
@@ -785,10 +834,39 @@ def fetch_thread(sql_factory, get_next, batch_size):
             logging.debug('%s: added %d, updated %d.', info.name,
                           added, updated)
 
+        if not (added or updated):
+            continue
+
+        for pattern, command in trigger_commands:
+            if fnmatch.fnmatch(info.klass.__name__, pattern):
+                logging.debug('Executing command %r since %s got changes '
+                              '(matched %r)',
+                              command, info.klass.__name__, pattern)
+                try:
+                    execute_locked(command)
+                except (thread.error, Failure), e:
+                    logging.error('could not execute %r: %s', command, e)
+
+        # TODO(dmw): run outside transaction or what?
+        for pattern, statement in trigger_statements:
+            if fnmatch.fnmatch(info.klass.__name__, pattern):
+                logging.debug('Executing SQL %r since %s got changes '
+                              '(matched %r)',
+                              statement, info.klass.__name__, pattern)
+                stmt_c = sql_factory().cursor()
+                stmt_c.execute('BEGIN')
+                try:
+                    stmt_c.execute(statement)
+                    stmt_c.execute('COMMIT')
+                except sqlite3.Error, e:
+                    logging.error('executing SQL %r failed: %s', statement, e)
+                del stmt_c
+
     logging.debug('thread exiting; no more work.')
 
 
-def fetch(sql_factory, infos, worker_count, batch_size):
+def fetch(sql_factory, infos, worker_count, batch_size,
+          trigger_commands, trigger_statements):
     '''
     Fetch data from the AppEngine Datastore via remote_api and save it to the
     database. Synchronization happens differently depending on the properties
@@ -802,10 +880,16 @@ def fetch(sql_factory, infos, worker_count, batch_size):
           value, then iteratively fetch entities with a higher __key__ value
           using an index query.
 
-    @param[in]  sql_factory     DBAPI connection factory.
-    @param[in]  infos           Output of get_model_map().
-    @param[in]  worker_count    Number of worker threads to use.
-    @param[in]  batch_size      Number entities to fetch per request.
+    @param[in]  sql_factory         DBAPI connection factory.
+    @param[in]  infos               Output of get_model_map().
+    @param[in]  worker_count        Number of worker threads to use.
+    @param[in]  batch_size          Number entities to fetch per request.
+    @param[in]  trigger_commands    List of ('ModelClass', 'command') shell
+                                    commands execute when ModelClass updates 
+                                    occur.
+    @param[in]  trigger_statements  List of ('ModelClass', 'command') SQL
+                                    statements execute when ModelClass updates
+                                    occur.
     '''
 
     sql = sql_factory()
@@ -842,7 +926,8 @@ def fetch(sql_factory, infos, worker_count, batch_size):
 
     for i in range(worker_count):
         thread = threading.Thread(target=safe_fetch_thread,
-                                  args=(sql_factory, get_next, batch_size))
+                                  args=(sql_factory, get_next, batch_size,
+                                        trigger_commands, trigger_statements))
         thread.start()
 
     end_event.wait()
@@ -877,7 +962,17 @@ def usage(msg=None):
         '               provided on the command line.\n'
         '\n'
         '  --sdk-path=<path>\n'
-        '               Path to AppEngine SDK installation directory.\n'
+        '               Path to AppEngine SDK (default: search).\n'
+        '\n'
+        '  --trigger-cmd "<ModelGlob>:command"\n'
+        '               Arrange for the given system command to be executed\n'
+        '               after new or updated entities whose class matches\n'
+        '               ModelGlob fetched (glob may contain * and ?).\n'
+        '\n'
+        '  --trigger-sql "<ModelGlob>:SQL STATEMENT"\n'
+        '               Arrange for the given SQL statement to be executed\n'
+        '               after new or updated entities whose class matches\n'
+        '               ModelGlob fetched (glob may contain * and ?).\n'
         '\n'
         '  --help       This message.\n'
         '\n'
@@ -957,11 +1052,13 @@ def main():
     batch_size = 50
     batch = False
     sdk_path = None
+    trigger_commands = []
+    trigger_statements = []
 
+    optlist = 'a:e:p:r:L:m:d:x:vN:C:'
+    longopts = [ 'batch', 'sdk-path=', 'help', 'trigger-cmd=', 'trigger-sql=' ]
     try:
-        optlist = 'a:e:p:r:L:m:d:x:vN:C:'
-        longoptlist = [ 'batch', 'sdk-path=', 'help' ]
-        opts, args = getopt.gnu_getopt(sys.argv[1:], optlist, longoptlist)
+        opts, args = getopt.gnu_getopt(sys.argv[1:], optlist, longopts)
     except getopt.GetoptError, e:
         usage(str(e))
         return 1
@@ -1005,6 +1102,18 @@ def main():
             sdk_path = optarg
         elif opt == '--help':
             usage()
+        elif opt in ('--trigger-cmd', '--trigger-sql'):
+            if (not optarg) or ':' not in optarg:
+                die('--trigger requires an argument.')
+
+            model, cmd = optarg.split(':', 1)
+            if not (model and cmd):
+                die('--trigger ModelClass or command not specified.')
+
+            if opt.endswith('cmd'):
+                trigger_commands.append((model, cmd))
+            else:
+                trigger_statements.append((model, cmd))
         else:
             assert False
 
@@ -1030,10 +1139,12 @@ def main():
     if command not in ('sync-model', 'fetch', 'orphaned', 'prune'):
         die('unrecognized command %r specified.', command)
 
+    # Validate model modules and loaded instances.
     if not model_modules:
         die('no model modules specified, at least one required.')
 
     models = get_models(lib_paths, model_modules, exclude_models)
+    names = set(klass.__name__ for klass in models)
     if not models:
         die('no google.appengine.ext.db.Model subclasses found in %s',
             model_modules)
@@ -1048,8 +1159,7 @@ def main():
     # DB on disk after a failed run).
     if command == 'fetch':
         if not (app_name and remote_path):
-            usage('a required parameter is missing.')
-            return 1
+            usage('missing -a or -r parameter.')
 
         init_sdk_env(app_name, auth_cb, remote_path)
 
@@ -1058,8 +1168,7 @@ def main():
         sql_factory = create_sqlite_factory(sql_path)
         sql = sql_factory()
     except sqlite3.OperationalError, e:
-        logging.error('could not open database: %s', e)
-        return 1
+        die('could not open database: %s', e)
 
     # Perform any common initializations here.
     build_translate_type_map()
@@ -1079,7 +1188,8 @@ def main():
     elif command == 'prune':
         prune_orphaned(sql, infos)
     elif command == 'fetch':
-        fetch(sql_factory, infos, worker_count, batch_size)
+        fetch(sql_factory, infos, worker_count, batch_size,
+              trigger_commands, trigger_statements)
     else:
         assert False
 
